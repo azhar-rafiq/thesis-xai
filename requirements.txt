@@ -1,0 +1,12 @@
+# ipykernel
+notebook
+numpy
+pandas
+seaborn
+tensorflow
+joblib
+
+dotenv
+
+kagglehub
+ipywidgets
