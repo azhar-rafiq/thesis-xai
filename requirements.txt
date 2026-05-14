@@ -10,3 +10,6 @@ dotenv
 
 kagglehub
 ipywidgets
+
+pydicom
+pathlib
