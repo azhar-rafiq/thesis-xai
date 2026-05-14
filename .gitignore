@@ -1,2 +1,4 @@
 thesis-venv/
 .env
+*.out
+*.stats
