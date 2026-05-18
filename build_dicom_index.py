@@ -45,7 +45,7 @@ if __name__ == '__main__':
     df = pd.DataFrame(results)
 
     #save to csv
-    df.to_csv('rsna_dicom_index.csv', index=False)
+    df.to_csv('rsna_dicom_index_2.csv', index=False)
     print(f"Done. Saved {len(df)} rows.")
 
     #check head

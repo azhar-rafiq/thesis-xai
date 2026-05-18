@@ -2,9 +2,9 @@
 #SBATCH --job-name=dicom_index
 #SBATCH --account=karwatha-karwath-hds-pg-research
 #SBATCH --qos=bbdefault
-#SBATCH --time=03:00:00
+#SBATCH --time=02:30:00
 #SBATCH --ntasks=1
-#SBATCH --cpus-per-task=8
+#SBATCH --cpus-per-task=12
 #SBATCH --mem=16G
 #SBATCH --output=dicom_index_%j.out
 
