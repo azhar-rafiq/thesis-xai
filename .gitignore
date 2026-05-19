@@ -5,4 +5,5 @@ thesis-venv/
 *.h5
 *.png
 *.pkl
-*.csv
+*.csv 
+*.npz
