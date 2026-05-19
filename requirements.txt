@@ -13,3 +13,8 @@ ipywidgets
 
 pydicom
 pathlib
+
+nibabel
+scikeras
+iterative-stratification
+scikit-image

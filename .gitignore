@@ -2,3 +2,7 @@ thesis-venv/
 .env
 *.out
 *.stats
+*.h5
+*.png
+*.pkl
+*.csv
