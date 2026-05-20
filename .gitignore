@@ -1,8 +1,12 @@
 thesis-venv/
+model-exported/
 .env
 *.out
 *.stats
 *.h5
 *.png
 *.pkl
-*.csv
+*.csv 
+*.npz
+*.log
+*.pyc
