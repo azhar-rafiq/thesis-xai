@@ -22,8 +22,8 @@ IMG_SIZE         = 256
 N_TRAIN_PATIENTS = 3000
 N_TEST_PATIENTS  = 750
 
-# If a smaller cache already exists and you want to extend it, set these.
-# Set both to None to always do a fresh load.
+# set these to extend if a smaller cache already exists
+# set both to None to always do a fresh load.
 OLD_TRAIN_PATIENTS = 800   # existing cache size is 800/200
 OLD_TEST_PATIENTS  = 200
 
@@ -33,8 +33,11 @@ label_cols = ['epidural', 'intraparenchymal', 'intraventricular', 'subarachnoid'
 sys.path.insert(0, os.path.expanduser('~/thesis-xai'))
 load_dotenv()
 
-os.environ['KAGGLEHUB_CACHE'] = os.getenv('KAGGLE_CACHE')
-KAGGLE_CACHE   = Path(os.environ['KAGGLEHUB_CACHE'])
+_kaggle_cache = os.getenv('KAGGLE_CACHE')
+if not _kaggle_cache:
+    raise EnvironmentError("KAGGLE_CACHE is not set in .env or environment")
+os.environ['KAGGLEHUB_CACHE'] = _kaggle_cache
+KAGGLE_CACHE   = Path(_kaggle_cache)
 CACHE_DIR      = KAGGLE_CACHE / 'preprocessed'
 RSNA_TRAIN_DIR = KAGGLE_CACHE / 'competitions/rsna-intracranial-hemorrhage-detection/rsna-intracranial-hemorrhage-detection/stage_2_train'
 LABELS_CSV     = KAGGLE_CACHE / 'competitions/stage_2_train.csv'
@@ -74,17 +77,18 @@ print(f"Preprocessing started at {datetime.datetime.now()}")
 print(f"Target: {N_TRAIN_PATIENTS} train patients, {N_TEST_PATIENTS} test patients")
 print(f"{'='*60}\n", flush=True)
 
-cache_file = CACHE_DIR / f'rsna_train{N_TRAIN_PATIENTS}_test{N_TEST_PATIENTS}_{IMG_SIZE}.npz'
+cache_base  = CACHE_DIR / f'rsna_train{N_TRAIN_PATIENTS}_test{N_TEST_PATIENTS}_{IMG_SIZE}'
+cache_exists = (cache_base.parent / (cache_base.name + '_x_train.npy')).exists()
 
-if cache_file.exists():
-    print(f"Cache already exists: {cache_file}")
-    print("Nothing to do. Delete the cache file if you want to reprocess.")
-    data = np.load(cache_file)
-    x_train, y_train = data['x_train'], data['y_train']
-    x_test,  y_test  = data['x_test'],  data['y_test']
+if cache_exists:
+    print(f"Cache already exists: {cache_base}_*.npy")
+    x_train = np.load(str(cache_base) + '_x_train.npy')
+    y_train = np.load(str(cache_base) + '_y_train.npy')
+    x_test  = np.load(str(cache_base) + '_x_test.npy')
+    y_test  = np.load(str(cache_base) + '_y_test.npy')
 
 else:
-    # Load DICOM index (metadata only — filename, PatientID, split)
+    # Load DICOM index (metadata only: filename, PatientID, split)
     print(f"Loading DICOM index from: {INDEX_CSV}", flush=True)
     dicom_index = pd.read_csv(INDEX_CSV)
     dicom_index = dicom_index[dicom_index['split'] == 'train']   # RSNA train set only
@@ -102,14 +106,14 @@ else:
     labels_wide = labels_wide[['SliceID'] + label_cols + ['any']]
     labels_wide = labels_wide.drop(columns=['any'])  # drop 'any' — derived label, causes leakage
 
-    # Merge with DICOM index to get PatientID per slice (notebook cell 74)
+    # merge with DICOM index to get PatientID per slice
     labels_wide['filename'] = labels_wide['SliceID'] + '.dcm'
     labels_with_patient = labels_wide.merge(
         dicom_index[['filename', 'PatientID']], on='filename', how='left'
     )
     labels_with_patient = labels_with_patient.dropna(subset=['PatientID'])
 
-    # Patient-level split — never slice-level, prevents data leakage (notebook cell 74)
+    # Patient-level split, NEVER slice-level, prevents data leakage
     gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
     train_idx, test_idx = next(gss.split(labels_with_patient, groups=labels_with_patient['PatientID']))
 
@@ -132,16 +136,16 @@ else:
 
     print(f"Selected — train slices: {len(train_df)}, test slices: {len(test_df)}", flush=True)
 
-    # Try to extend existing smaller cache
-    old_cache = CACHE_DIR / f'rsna_train{OLD_TRAIN_PATIENTS}_test{OLD_TEST_PATIENTS}_{IMG_SIZE}.npz'
+    # Try to extend existing smaller cache (.npy format only)
+    old_cache_base = CACHE_DIR / f'rsna_train{OLD_TRAIN_PATIENTS}_test{OLD_TEST_PATIENTS}_{IMG_SIZE}'
+    old_cache_npy  = old_cache_base.parent / (old_cache_base.name + '_x_train.npy')
 
-    if old_cache.exists() and OLD_TRAIN_PATIENTS < N_TRAIN_PATIENTS:
-        print(f"\nExtending from existing cache: {old_cache}", flush=True)
-        old_data     = np.load(old_cache)
-        x_train_old  = old_data['x_train']
-        y_train_old  = old_data['y_train']
-        x_test_old   = old_data['x_test']
-        y_test_old   = old_data['y_test']
+    if (OLD_TRAIN_PATIENTS is not None and OLD_TRAIN_PATIENTS < N_TRAIN_PATIENTS and old_cache_npy.exists()):
+        print(f"\nExtending from existing cache: {old_cache_base}_*.npy", flush=True)
+        x_train_old = np.load(str(old_cache_base) + '_x_train.npy')
+        y_train_old = np.load(str(old_cache_base) + '_y_train.npy')
+        x_test_old  = np.load(str(old_cache_base) + '_x_test.npy')
+        y_test_old  = np.load(str(old_cache_base) + '_y_test.npy')
 
         # Patients already in old cache (first OLD_N from same split)
         old_train_patients = set(train_patients_all[:OLD_TRAIN_PATIENTS])
@@ -162,6 +166,10 @@ else:
         x_test  = np.concatenate([x_test_old,  x_test_new])
         y_test  = np.concatenate([y_test_old,   y_test_new])
 
+        # save RAM
+        del x_train_old, y_train_old, x_test_old, y_test_old
+        del x_train_new, y_train_new, x_test_new, y_test_new
+
     else:
         # Fresh load from scratch
         print("\nNo existing cache to extend — processing DICOMs from scratch...", flush=True)
@@ -171,10 +179,13 @@ else:
         print("Loading test set...", flush=True)
         x_test, y_test   = load_from_df(test_df,  label_cols)
 
-    print(f"\nSaving to cache: {cache_file}", flush=True)
-    np.savez(cache_file,
-             x_train=x_train, y_train=y_train,
-             x_test=x_test,   y_test=y_test)
+    print(f"\nSaving to cache: {cache_base}", flush=True)
+
+    # save as separate .npy files, avoids np.savez's internal temp copy
+    np.save(str(cache_base) + '_x_train.npy', x_train)
+    np.save(str(cache_base) + '_y_train.npy', y_train)
+    np.save(str(cache_base) + '_x_test.npy',  x_test)
+    np.save(str(cache_base) + '_y_test.npy',  y_test)
     print("Saved.", flush=True)
 
 print(f"\nx_train: {x_train.shape}, y_train: {y_train.shape}")
