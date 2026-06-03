@@ -1,0 +1,5 @@
+total patients:                          18938
+total studies:                           21744
+avg studies per patient:                 1.148
+patients with >1 study:                  1758
+patients with conflicting labels:        685
