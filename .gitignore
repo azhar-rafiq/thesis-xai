@@ -10,3 +10,4 @@ model-exported/
 *.npz
 *.log
 *.pyc
+*.html

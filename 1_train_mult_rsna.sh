@@ -2,10 +2,10 @@
 #SBATCH --account=karwatha-karwath-hds-pg-research
 #SBATCH --qos=bbgpu
 #SBATCH --gres=gpu:a100:1
-#SBATCH --time=12:00:00
-#SBATCH --mem=128G
+#SBATCH --time=48:00:00
+#SBATCH --mem=490G
 #SBATCH --cpus-per-task=8
-#SBATCH --output=train_%j.log
+#SBATCH --output=train_mult_rsna_%j.log
 #SBATCH --job-name=rsna-train
 
 echo "Job started: $(date)"

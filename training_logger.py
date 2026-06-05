@@ -12,7 +12,7 @@ import pandas as pd
 from pathlib import Path
 from sklearn.metrics import roc_auc_score
 
-MODEL_DIR = Path("model-exported")
+MODEL_DIR = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/models')
 LOG_FILE  = Path("training_log.csv")
 
 FIELDNAMES = [
@@ -27,26 +27,36 @@ FIELDNAMES = [
 ]
 
 
-def save_models(grid, model_name=None):
+def save_models(grid, model_name=None, best_estimator=None, keras_model=None):
     """
     Save best estimator as <model_name>.pkl and <model_name>.keras
     inside model-exported/. Returns (pkl_path, keras_path).
 
     model_name defaults to rsna_model_<cv_auc>_auc, e.g. rsna_model_0.8181_auc.
+    best_estimator overrides grid.best_estimator_ (use when retrained on full data).
+    keras_model accepts a raw tf.keras.Model when the final retrain bypassed sklearn.
     """
     MODEL_DIR.mkdir(exist_ok=True)
 
     if model_name is None:
-        model_name = f"rsna_model_{grid.best_score_:.4f}_auc"
+        import math
+        date_str  = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+        score_str = "gs_skipped" if math.isnan(grid.best_score_) else f"{grid.best_score_:.4f}_auc"
+        model_name = f"rsna_model_{date_str}_{score_str}"
 
     pkl_path   = MODEL_DIR / f"{model_name}.pkl"
     keras_path = MODEL_DIR / f"{model_name}.keras"
 
-    joblib.dump(grid.best_estimator_, pkl_path, compress=1)
-    grid.best_estimator_.named_steps["clf"].model_.save(str(keras_path))
+    if keras_model is not None:
+        joblib.dump(keras_model, pkl_path, compress=1)
+        keras_model.save(str(keras_path))
+    else:
+        estimator = best_estimator if best_estimator is not None else grid.best_estimator_
+        joblib.dump(estimator, pkl_path, compress=1)
+        estimator.named_steps["clf"].model_.save(str(keras_path))
 
-    print(f"✅ Saved  {pkl_path}")
-    print(f"✅ Saved  {keras_path}")
+    print(f"Saved  {pkl_path}")
+    print(f"Saved  {keras_path}")
     return pkl_path, keras_path
 
 
