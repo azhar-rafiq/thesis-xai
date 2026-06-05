@@ -1,5 +1,6 @@
 thesis-venv/
 model-exported/
+backup/
 .env
 *.out
 *.stats

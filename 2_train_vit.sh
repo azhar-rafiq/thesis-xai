@@ -5,8 +5,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --mem=490G
 #SBATCH --cpus-per-task=8
-#SBATCH --output=train_mult_rsna_%j.log
-#SBATCH --job-name=rsna-train
+#SBATCH --output=train_vit_%j.log
+#SBATCH --job-name=train_vit
 
 echo "Job started: $(date)"
 echo "Node: $(hostname)"
@@ -20,6 +20,6 @@ module load cuDNN/9.8.0.87-CUDA-12.6.0
 
 source ~/thesis-xai/thesis-venv/bin/activate
 
-python ~/thesis-xai/1_train_mult_rsna.py
+python ~/thesis-xai/2_train_vit.py
 
 echo "Job finished: $(date)"

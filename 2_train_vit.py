@@ -1,12 +1,13 @@
 """
-RSNA Intracranial Hemorrhage -- Vision Transformer Training Script
-Run via sbatch: sbatch 2_train_transformer.sh
+RSNA intracranial hemorrhage: ViT grid search training script.
+run via sbatch: sbatch 2_train_vit.sh
 """
 
 import gc
 import os
 import sys
 import json
+import random
 import datetime
 import types
 import numpy as np
@@ -15,8 +16,7 @@ from collections import defaultdict
 from tensorflow.keras import models, layers, optimizers, callbacks
 from sklearn.pipeline import Pipeline
 from sklearn.model_selection import GridSearchCV
-from sklearn.metrics import roc_auc_score, make_scorer
-from sklearn.utils.class_weight import compute_sample_weight
+from sklearn.metrics import roc_auc_score
 from scikeras.wrappers import KerasClassifier
 from iterstrat.ml_stratifiers import MultilabelStratifiedKFold, MultilabelStratifiedShuffleSplit
 from pathlib import Path
@@ -26,6 +26,11 @@ sys.path.insert(0, os.path.expanduser('~/thesis-xai'))
 from training_logger import save_models, log_run
 
 load_dotenv()
+SEED       = 20260605
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
+
 CACHE_DIR  = Path(os.getenv('KAGGLE_CACHE')) / 'preprocessed'
 IMG_SIZE   = 256
 label_cols = ['epidural', 'intraparenchymal', 'intraventricular', 'subarachnoid', 'subdural']
@@ -54,7 +59,7 @@ print(f"\nx_train: {x_train.shape}, y_train: {y_train.shape}", flush=True)
 print(f"x_val:   {x_val.shape},   y_val:   {y_val.shape}", flush=True)
 print(f"x_test:  {x_test.shape},  y_test:  {y_test.shape}", flush=True)
 
-# GPU setup
+# enable GPU memory growth and log device details
 gpus = tf.config.list_physical_devices('GPU')
 print(f"\nGPUs available: {len(gpus)}", flush=True)
 for gpu in gpus:
@@ -68,12 +73,10 @@ if not gpus:
 
 
 class DataStreamKerasClassifier(KerasClassifier):
-    # streams data in batches via a generator so TF never allocates the full
-    # array as a constant. pipeline order: from_generator -> shuffle -> batch,
-    # so the shuffle buffer holds N samples (not batches) in RAM.
+    # generator-based streaming so TF never allocates the full array as a constant; shuffling operates on individual samples
 
     @staticmethod
-    def _make_dataset(X, y, sample_weight, batch_size, shuffle):
+    def _make_dataset(X, y, sample_weight, batch_size, shuffle, augment=False):
         n = len(X)
         y_shape = (y.shape[1],) if y.ndim > 1 else ()
         sig = (
@@ -84,9 +87,7 @@ class DataStreamKerasClassifier(KerasClassifier):
             sig += (tf.TensorSpec(shape=(), dtype=tf.float32),)
 
         def gen():
-            # yields individual samples sequentially for fast NFS reads.
-            # shuffle buffer (10000 samples * 768 KB = ~7.5 GB) provides
-            # randomisation without random mmap seeks across the 349 GB file.
+            # sequential NFS reads avoid random mmap seeks; shuffle buffer randomises at sample level
             while True:
                 for i in range(n):
                     xi = X[i].astype('float32')
@@ -99,13 +100,30 @@ class DataStreamKerasClassifier(KerasClassifier):
         ds = tf.data.Dataset.from_generator(gen, output_signature=sig)
         if shuffle:
             ds = ds.shuffle(buffer_size=10000)
-        return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+        ds = ds.batch(batch_size)
+
+        if augment:
+            # matches CNN augmentation: ±5 deg rotation and ±8% zoom/translation for scanner variance
+            augmenter = tf.keras.Sequential([
+                layers.RandomFlip("horizontal"),
+                layers.RandomRotation(factor=5/360, fill_mode='constant'),
+                layers.RandomZoom(height_factor=0.08, width_factor=0.08, fill_mode='constant'),
+                layers.RandomTranslation(height_factor=0.08, width_factor=0.08, fill_mode='constant'),
+            ])
+            if sample_weight is not None:
+                ds = ds.map(lambda x, y, w: (augmenter(x, training=True), y, w),
+                            num_parallel_calls=tf.data.AUTOTUNE)
+            else:
+                ds = ds.map(lambda x, y: (augmenter(x, training=True), y),
+                            num_parallel_calls=tf.data.AUTOTUNE)
+
+        return ds.prefetch(tf.data.AUTOTUNE)
 
     def _fit_keras_model(self, X, y, sample_weight, warm_start, epochs, initial_epoch, **kwargs):
         batch_size      = self.get_params().get('batch_size', 32)
         steps_per_epoch = int(np.ceil(len(X) / batch_size))
 
-        train_ds = self._make_dataset(X, y, sample_weight, batch_size, shuffle=True)
+        train_ds = self._make_dataset(X, y, sample_weight, batch_size, shuffle=True, augment=True)
 
         val_data  = kwargs.pop('validation_data', None)
         val_steps = None
@@ -137,6 +155,7 @@ class PositionEmbedding(layers.Layer):
         super().__init__(**kwargs)
         self.num_patches = num_patches
         self.embed       = layers.Embedding(input_dim=num_patches, output_dim=embed_dim)
+        # docs Embedding: https://www.tensorflow.org/api_docs/python/tf/keras/layers/Embedding
 
     def call(self, x):
         positions = tf.range(start=0, limit=self.num_patches, delta=1)
@@ -151,14 +170,7 @@ class PositionEmbedding(layers.Layer):
 
 def getModel(patch_size=16, embed_dim=64, num_heads=4,
              num_blocks=2, mlp_dim=128, lr=0.0001, dropoutrate=0.1):
-    """
-    Mini Vision Transformer (ViT) for multi-label ICH classification.
-
-    1. split image into non-overlapping patches via Conv2D(stride=patch_size)
-    2. add learnable positional embeddings
-    3. run through N transformer blocks (attention + FFN)
-    4. global average pool -> Dense(5, sigmoid)
-    """
+    """mini ViT: patch embedding -> learnable pos embed -> N transformer blocks -> GAP -> Dense(5, sigmoid)."""
     # release the previous fold's model and tensors before building a new one
     tf.keras.backend.clear_session()
 
@@ -166,13 +178,14 @@ def getModel(patch_size=16, embed_dim=64, num_heads=4,
 
     inputs = layers.Input((IMG_SIZE, IMG_SIZE, 3))
 
-    # patch embedding: Conv2D with stride=patch_size extracts non-overlapping
-    # patches and projects each to embed_dim dimensions in one step
+    # Conv2D doubles as patch extractor: stride=patch_size gives non-overlapping patches projected to embed_dim
     x = layers.Conv2D(embed_dim, kernel_size=patch_size, strides=patch_size, padding='valid')(inputs)
     x = layers.Reshape((num_patches, embed_dim))(x)
 
     x = PositionEmbedding(num_patches, embed_dim)(x)
 
+    # docs MultiHeadAttention: https://www.tensorflow.org/api_docs/python/tf/keras/layers/MultiHeadAttention
+    # docs LayerNormalization: https://www.tensorflow.org/api_docs/python/tf/keras/layers/LayerNormalization
     for _ in range(num_blocks):
         attn = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim // num_heads)(x, x)
         attn = layers.Dropout(dropoutrate)(attn)
@@ -184,6 +197,7 @@ def getModel(patch_size=16, embed_dim=64, num_heads=4,
         ffn = layers.Dropout(dropoutrate)(ffn)
         x   = layers.LayerNormalization(epsilon=1e-6)(x + ffn)
 
+    # docs GlobalAveragePooling1D: https://www.tensorflow.org/api_docs/python/tf/keras/layers/GlobalAveragePooling1D
     x       = layers.GlobalAveragePooling1D()(x)
     x       = layers.Dense(128, activation='gelu')(x)
     x       = layers.Dropout(dropoutrate)(x)
@@ -192,30 +206,24 @@ def getModel(patch_size=16, embed_dim=64, num_heads=4,
     vit = models.Model(inputs, outputs)
     vit.compile(
         optimizer=optimizers.Adam(learning_rate=lr),
-        loss='binary_crossentropy',
+        loss=tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0),
         metrics=['recall', tf.keras.metrics.AUC(name='auc', multi_label=True)]
     )
     return vit
 
 
-any_hemorrhage = (y_train.max(axis=1) > 0).astype(int)
-sample_weights = compute_sample_weight('balanced', any_hemorrhage)
-
-# set to True to skip grid search and use hardcoded best params from a previous run.
-# set to False to run the full grid search.
+# set True to skip grid search and reuse hardcoded best params from a prior run
 SKIP_GRID_SEARCH = False
 
 if not SKIP_GRID_SEARCH:
-    # 3% subsample keeps each fold copy at ~8.4 GB so all 20 folds accumulated
-    # stay within 490 GB even if TF holds references between folds.
-    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.97, random_state=42)
+    # 3% subsample keeps per-fold memory low so accumulated folds stay within node budget
+    msss = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.97, random_state=SEED)
     sub_idx, _ = next(msss.split(x_train, y_train))
-    x_sub              = x_train[sub_idx]
-    y_sub              = y_train[sub_idx]
-    sample_weights_sub = sample_weights[sub_idx]
+    x_sub = x_train[sub_idx]
+    y_sub = y_train[sub_idx]
     print(f"Subsample: {len(x_sub):,} slices ({len(x_sub)/len(x_train)*100:.1f}%)", flush=True)
 
-    msss_val = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.95, random_state=42)
+    msss_val = MultilabelStratifiedShuffleSplit(n_splits=1, test_size=0.95, random_state=SEED)
     val_cv_idx, _ = next(msss_val.split(x_val, y_val))
     x_val_cv = x_val[val_cv_idx]
     y_val_cv = y_val[val_cv_idx]
@@ -230,24 +238,26 @@ if not SKIP_GRID_SEARCH:
     )
     pipe = Pipeline([('clf', clf)])
 
-    def multi_label_auc(y_true, y_pred):
-        return roc_auc_score(y_true, y_pred, average='weighted')
+    def multi_label_auc_scorer(estimator, X, y):
+        # callable scorer bypasses sklearn's is_classifier() check that fails on DataStreamKerasClassifier in sklearn 1.8
+        y_pred = estimator.predict_proba(X)
+        return roc_auc_score(y, y_pred, average='weighted')
 
     grid = GridSearchCV(
         estimator=pipe,
         param_grid=[{
-            'clf__model__patch_size':  [16, 32],
-            'clf__model__embed_dim':   [64],
+            'clf__model__patch_size':  [16],
+            'clf__model__embed_dim':   [64, 128],
             'clf__model__num_heads':   [4],
-            'clf__model__num_blocks':  [2, 4],
-            'clf__model__mlp_dim':     [128],
+            'clf__model__num_blocks':  [4],
+            'clf__model__mlp_dim':     [128, 256],
             'clf__model__lr':          [0.0001],
             'clf__model__dropoutrate': [0.1],
             'clf__epochs':             [30],
             'clf__batch_size':         [64],
         }],
-        scoring=make_scorer(multi_label_auc, needs_proba=True),
-        cv=MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=42),
+        scoring=multi_label_auc_scorer,
+        cv=MultilabelStratifiedKFold(n_splits=5, shuffle=True, random_state=SEED),
         n_jobs=1,
         error_score='raise',
         verbose=2,
@@ -259,7 +269,6 @@ if not SKIP_GRID_SEARCH:
 
     gs_start = datetime.datetime.now()
     grid.fit(x_sub, y_sub.astype(int),
-             clf__sample_weight=sample_weights_sub,
              clf__validation_data=(x_val_cv, y_val_cv))
     gs_end  = datetime.datetime.now()
     gs_time = gs_end - gs_start
@@ -273,7 +282,7 @@ if not SKIP_GRID_SEARCH:
     print(f"Best params:   {grid.best_params_}")
     print(f"{'='*60}\n", flush=True)
 
-    del x_sub, y_sub, sample_weights_sub, x_val_cv, y_val_cv
+    del x_sub, y_sub, x_val_cv, y_val_cv
     gc.collect()
 
 else:
@@ -282,18 +291,17 @@ else:
         'clf__batch_size':           64,
         'clf__epochs':               30,
         'clf__model__patch_size':    16,
-        'clf__model__embed_dim':     64,
+        'clf__model__embed_dim':     128,
         'clf__model__num_heads':     4,
         'clf__model__num_blocks':    4,
-        'clf__model__mlp_dim':       128,
+        'clf__model__mlp_dim':       256,
         'clf__model__lr':            0.0001,
         'clf__model__dropoutrate':   0.1,
     }
     grid = types.SimpleNamespace(best_params_=_best, best_score_=float('nan'))
-    print(f"Skipping grid search -- using hardcoded params: {_best}", flush=True)
+    print(f"Skipping grid search, using hardcoded params: {_best}", flush=True)
 
-# build the best model directly -- bypasses scikeras so TF never allocates
-# 349 GB + 76 GB as constants (the path model.fit(numpy) takes internally).
+# build best model directly, bypassing scikeras to avoid allocating train and val arrays as TF constants
 _bp             = grid.best_params_
 best_batch_size = _bp['clf__batch_size']
 best_epochs     = _bp['clf__epochs']
@@ -308,17 +316,32 @@ train_steps = int(np.ceil(n_train / best_batch_size))
 val_steps   = int(np.ceil(n_val   / best_batch_size))
 
 train_ds = DataStreamKerasClassifier._make_dataset(
-    x_train, y_train, sample_weights, best_batch_size, shuffle=True)
+    x_train, y_train, None, best_batch_size, shuffle=True, augment=True)
 val_ds   = DataStreamKerasClassifier._make_dataset(
     x_val, y_val, None, best_batch_size, shuffle=False)
 
-# save best weights to disk after every epoch that improves val_auc --
-# if the job hits the SLURM walltime before model.fit() returns,
-# the best checkpoint is still recoverable.
+# saves best weights each epoch so the checkpoint survives if SLURM walltime hits before fit() returns
 MODEL_EXPORT_DIR = '/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/models'
 os.makedirs(MODEL_EXPORT_DIR, exist_ok=True)
 checkpoint_path = os.path.join(MODEL_EXPORT_DIR,
     f'vit_checkpoint_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.keras')
+
+total_steps  = train_steps * best_epochs
+warmup_steps = max(1, int(0.1 * total_steps))
+lr           = _bp['clf__model__lr']
+lr_schedule  = tf.keras.optimizers.schedules.CosineDecay(
+    initial_learning_rate=0.0,
+    decay_steps=total_steps,
+    warmup_steps=warmup_steps,
+    warmup_target=lr,
+    alpha=1e-6 / lr,
+)
+best_model.compile(
+    optimizer=tf.keras.optimizers.AdamW(learning_rate=lr_schedule, weight_decay=1e-4),
+    loss=tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0),
+    metrics=['recall', tf.keras.metrics.AUC(name='auc', multi_label=True)]
+)
+print(f"Retrain: AdamW + cosine warmup ({warmup_steps} warmup / {total_steps} total steps)", flush=True)
 
 retrain_started = datetime.datetime.now()
 print(f"Retraining best ViT on full x_train...", flush=True)
@@ -330,7 +353,6 @@ best_model.fit(
     epochs=best_epochs,
     callbacks=[
         callbacks.EarlyStopping(monitor='val_auc', patience=5, mode='max', restore_best_weights=True),
-        callbacks.ReduceLROnPlateau(monitor='val_auc', factor=0.5, patience=3, mode='max', min_lr=1e-6),
         callbacks.ModelCheckpoint(
             filepath=checkpoint_path,
             monitor='val_auc',
@@ -343,7 +365,7 @@ best_model.fit(
 total = datetime.datetime.now() - retrain_started
 print(f"Full retrain complete.", flush=True)
 
-# predict in batches -- avoids converting 75 GB x_test to a TF constant
+# predict in batches to avoid converting x_test to a TF constant
 y_pred_proba = np.vstack([
     best_model.predict_on_batch(x_test[i : i + best_batch_size].copy())
     for i in range(0, len(x_test), best_batch_size)
@@ -360,7 +382,7 @@ print(f"  {'weighted average':25s} AUC: {roc_auc_score(y_test, y_pred_proba, ave
 
 os.chdir(os.path.expanduser('~/thesis-xai'))
 
-pkl_path, keras_path = save_models(grid, keras_model=best_model)
+pkl_path, keras_path = save_models(grid, keras_model=best_model, method='vit')
 
 log_run(
     grid=grid,
@@ -374,6 +396,8 @@ log_run(
     total_timedelta=total,
     model_pkl=pkl_path,
     model_h5=keras_path,
+    method='vit',
+    loss='focal'
 )
 
 print("\nDone!")

@@ -42,7 +42,7 @@ from dotenv import load_dotenv
 #
 # why sbatch does not accumulate RAM:
 #   old approach built a Python list of all images then called np.array(), which held
-#   the entire dataset in RAM twice during conversion (~150 GB for 3750 patients).
+#   the entire dataset in RAM twice during conversion (~668 GB for 18,253 patients).
 #   here, np.lib.format.open_memmap() pre-allocates the output file on disk and returns
 #   a view - each write goes directly to the OS page cache and is flushed to disk
 #   asynchronously. the job requested 64 GB but real peak usage should be under 10 GB.

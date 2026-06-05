@@ -16,33 +16,38 @@ MODEL_DIR = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/model
 LOG_FILE  = Path("training_log.csv")
 
 FIELDNAMES = [
-    "timestamp", "model_pkl", "model_h5",
+    "timestamp", "method", "model_pkl", "model_h5",
     "n_train_patients", "n_test_patients", "n_train_slices", "n_test_slices",
     "best_cv_auc",
     "test_auc_epidural", "test_auc_intraparenchymal", "test_auc_intraventricular",
     "test_auc_subarachnoid", "test_auc_subdural", "test_auc_any",
     "test_auc_weighted",
-    "filters1", "filters2", "filters3", "lr", "dropout", "epochs", "batch_size",
+    "filters1", "filters2", "filters3",
+    "patch_size", "embed_dim", "num_heads", "num_blocks", "mlp_dim",
+    "lr", "loss", "dropout", "epochs", "batch_size",
     "duration_min",
 ]
 
 
-def save_models(grid, model_name=None, best_estimator=None, keras_model=None):
+def save_models(grid, model_name=None, best_estimator=None, keras_model=None,
+                dataset='rsna', method='cnn'):
     """
-    Save best estimator as <model_name>.pkl and <model_name>.keras
-    inside model-exported/. Returns (pkl_path, keras_path).
+    save best estimator as <model_name>.pkl and <model_name>.keras in MODEL_DIR.
+    returns (pkl_path, keras_path).
 
-    model_name defaults to rsna_model_<cv_auc>_auc, e.g. rsna_model_0.8181_auc.
+    model_name defaults to <dataset>_<method>_<date>_<cv_auc>_auc,
+    e.g. rsna_vit_20260605_08107_auc.
     best_estimator overrides grid.best_estimator_ (use when retrained on full data).
     keras_model accepts a raw tf.keras.Model when the final retrain bypassed sklearn.
     """
     MODEL_DIR.mkdir(exist_ok=True)
 
     if model_name is None:
-        import math
-        date_str  = datetime.datetime.now().strftime("%Y%m%d_%H%M")
-        score_str = "gs_skipped" if math.isnan(grid.best_score_) else f"{grid.best_score_:.4f}_auc"
-        model_name = f"rsna_model_{date_str}_{score_str}"
+        import math, string, random as _random
+        date_str  = datetime.datetime.now().strftime("%Y%m%d")
+        rand_tag  = ''.join(_random.choices(string.ascii_uppercase, k=2))
+        score_str = "nan" if math.isnan(grid.best_score_) else f"{grid.best_score_:.4f}".replace('.', '')
+        model_name = f"{dataset}_{method}_{date_str}-{rand_tag}_{score_str}_auc"
 
     pkl_path   = MODEL_DIR / f"{model_name}.pkl"
     keras_path = MODEL_DIR / f"{model_name}.keras"
@@ -72,6 +77,8 @@ def log_run(
     total_timedelta,
     model_pkl,
     model_h5,
+    method='cnn',
+    loss='bce',
 ):
     per_class = _per_class_aucs(y_test, y_pred_proba, label_cols)
     try:
@@ -83,6 +90,7 @@ def log_run(
 
     row = {
         "timestamp":                 datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "method":                    method,
         "model_pkl":                 str(model_pkl),
         "model_h5":                  str(model_h5),
         "n_train_patients":          N_TRAIN_PATIENTS,
@@ -100,7 +108,13 @@ def log_run(
         "filters1":                  bp.get("clf__model__filters1"),
         "filters2":                  bp.get("clf__model__filters2"),
         "filters3":                  bp.get("clf__model__filters3"),
+        "patch_size":                bp.get("clf__model__patch_size"),
+        "embed_dim":                 bp.get("clf__model__embed_dim"),
+        "num_heads":                 bp.get("clf__model__num_heads"),
+        "num_blocks":                bp.get("clf__model__num_blocks"),
+        "mlp_dim":                   bp.get("clf__model__mlp_dim"),
         "lr":                        bp.get("clf__model__lr"),
+        "loss":                      loss,
         "dropout":                   bp.get("clf__model__dropoutrate"),
         "epochs":                    bp.get("clf__epochs"),
         "batch_size":                bp.get("clf__batch_size"),
