@@ -5,8 +5,8 @@
 #SBATCH --time=48:00:00
 #SBATCH --mem=490G
 #SBATCH --cpus-per-task=8
-#SBATCH --output=train_vit_%j.log
-#SBATCH --job-name=train_vit
+#SBATCH --output=segmentation_%j.log
+#SBATCH --job-name=rsna_segmentation
 
 echo "Job started: $(date)"
 echo "Node: $(hostname)"
@@ -20,9 +20,6 @@ module load cuDNN/9.8.0.87-CUDA-12.6.0
 
 source ~/thesis-xai/thesis-venv/bin/activate
 
-# XLA auto-JIT can deadlock on the validation pass for transformer models with large val sets (multiple batch sizes trigger many compiled variants).
-export TF_XLA_FLAGS="--tf_xla_auto_jit=0"
-
-python ~/thesis-xai/2_train_vit.py
+python ~/thesis-xai/4_segmentation_xai.py
 
 echo "Job finished: $(date)"

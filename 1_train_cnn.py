@@ -196,7 +196,7 @@ def getModel(filters1=16, filters2=32, filters3=64,
     # docs losses: https://www.tensorflow.org/api_docs/python/tf/keras/losses
     cnn.compile(
         optimizer=optimizers.Adam(learning_rate=lr, clipnorm=1.0),
-        loss=tf.keras.losses.BinaryFocalCrossentropy(gamma=2.0),
+        loss=tf.keras.losses.BinaryFocalCrossentropy(gamma=1.0),
         metrics=['recall', tf.keras.metrics.AUC(name='auc', multi_label=True)]
     )
     return cnn

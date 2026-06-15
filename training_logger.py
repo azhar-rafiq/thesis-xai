@@ -25,7 +25,9 @@ FIELDNAMES = [
     "filters1", "filters2", "filters3",
     "patch_size", "embed_dim", "num_heads", "num_blocks", "mlp_dim",
     "lr", "loss", "dropout", "epochs", "batch_size",
+    "source_cnn", "source_vit",
     "duration_min",
+    "model_status",
 ]
 
 
@@ -79,6 +81,9 @@ def log_run(
     model_h5,
     method='cnn',
     loss='bce',
+    source_cnn='',
+    source_vit='',
+    model_status='ok',
 ):
     per_class = _per_class_aucs(y_test, y_pred_proba, label_cols)
     try:
@@ -118,7 +123,10 @@ def log_run(
         "dropout":                   bp.get("clf__model__dropoutrate"),
         "epochs":                    bp.get("clf__epochs"),
         "batch_size":                bp.get("clf__batch_size"),
+        "source_cnn":                source_cnn,
+        "source_vit":                source_vit,
         "duration_min":              round(total_timedelta.total_seconds() / 60, 2),
+        "model_status":              model_status,
     }
 
     write_header = not LOG_FILE.exists()

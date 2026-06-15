@@ -95,7 +95,7 @@ class PositionEmbedding(tf.keras.layers.Layer):
                        'embed_dim':   self.embed.output_dim})
         return config
 
-VIT_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_vit_20260605_08034_auc.keras')
+VIT_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_vit_20260608-ZU_08740_auc.keras')
 if not os.path.exists(VIT_CKPT):
     raise FileNotFoundError(f"ViT checkpoint not found: {VIT_CKPT}")
 print(f"Loading ViT:  {os.path.basename(VIT_CKPT)}", flush=True)
@@ -196,6 +196,8 @@ log_run(
     y_pred_proba=y_pred_proba,
     method='hybrid',
     loss='focal',
+    source_cnn=os.path.basename(CNN_CKPT),
+    source_vit=os.path.basename(VIT_CKPT),
     x_train=x_train,
     x_test=x_test,
     label_cols=label_cols,
