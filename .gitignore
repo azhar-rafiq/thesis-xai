@@ -1,6 +1,7 @@
 thesis-venv/
 model-exported/
 backup/
+result/
 .env
 *.out
 *.stats
@@ -12,3 +13,4 @@ backup/
 *.log
 *.pyc
 *.html
+*.zip

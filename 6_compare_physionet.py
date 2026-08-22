@@ -19,6 +19,7 @@ import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers
 from pathlib import Path
+from scipy import ndimage as ndi
 from skimage.transform import resize
 from dotenv import load_dotenv
 
@@ -46,6 +47,8 @@ CT_DIR           = PHYSIONET_DIR / 'ct_scans'
 MASK_DIR         = PHYSIONET_DIR / 'masks'
 MODEL_EXPORT_DIR = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/models')
 OUTPUT_DIR       = Path(os.path.expanduser('~/thesis-xai'))
+
+ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')   # shared across all figures/CSVs saved by this run
 
 IMG_SIZE     = 256
 BATCH_SIZE   = 16
@@ -258,6 +261,133 @@ pos_idx = slice_df[slice_df['has_ich'] == 1].index.values
 print(f"  positive slices for evaluation: {len(pos_idx)}", flush=True)
 
 
+# 2b. step-by-step pipeline figure for one ICH-positive slice (presentation aid):
+#     raw HU -> brain/subdural/soft windows -> RGB composite (model input) -> ground
+#     truth -> overlay -> training-time augmentation. Runs before the GPU/model work
+#     below so it's cheap to regenerate on its own.
+if MATPLOTLIB and len(pos_idx) > 0:
+    print("\nBuilding step-by-step pipeline figure...", flush=True)
+
+    # single clearest example: positive slice with the largest lesion area
+    areas        = [float(y_test[i, :, :, 0].sum()) for i in pos_idx]
+    demo_idx     = int(pos_idx[int(np.argmax(areas))])
+    demo_patient = int(slice_df.loc[demo_idx, 'patient'])
+    demo_slice   = int(slice_df.loc[demo_idx, 'slice'])
+    print(f"  demo slice: patient {demo_patient}, slice {demo_slice}", flush=True)
+
+    # reload the raw (un-windowed, un-resized) HU slice for this one patient --
+    # PhysioNet ships NIfTI volumes already in HU (no DICOM RescaleSlope/Intercept
+    # step needed, unlike the RSNA pipeline in 0_preprocess_rsna.py)
+    raw_vol = nib.load(str(CT_DIR / f'{demo_patient:03d}.nii')).get_fdata().astype(np.float32)
+    raw_hu  = raw_vol[:, :, demo_slice]
+
+    brain_w    = x_test[demo_idx, :, :, 0]
+    subdural_w = x_test[demo_idx, :, :, 1]
+    soft_w     = x_test[demo_idx, :, :, 2]
+    composite  = x_test[demo_idx]                 # (H, W, 3) RGB -- actual model input
+    gt_mask    = y_test[demo_idx, :, :, 0]
+
+    overlay_flat = composite.copy()
+    overlay_flat[gt_mask > 0.5] = [1.0, 0.0, 0.0]
+    overlay = np.clip(0.55 * composite + 0.45 * overlay_flat, 0.0, 1.0)
+
+    def _zoom_and_crop(img, factor):
+        """same as the training-time helper in 1_train_cnn.py"""
+        h, w   = img.shape[:2]
+        zoomed = ndi.zoom(img, [factor, factor, 1.0], mode='constant', cval=0.0, order=1)
+        zh, zw = zoomed.shape[:2]
+        if factor >= 1.0:
+            y0, x0 = (zh - h) // 2, (zw - w) // 2
+            return zoomed[y0:y0 + h, x0:x0 + w, :]
+        result = np.zeros_like(img)
+        py, px = (h - zh) // 2, (w - zw) // 2
+        result[py:py + zh, px:px + zw, :] = zoomed
+        return result
+
+    # deterministic, max-magnitude versions of the training-time augmentations
+    # (AUG_ROT_DEG / AUG_ZOOM_PCT / AUG_TRANS_PCT in 1_train_cnn.py), applied to the
+    # RGB composite so each transform's visual effect is unambiguous in the figure
+    aug_flip  = np.flip(composite, axis=1)
+    aug_rot   = ndi.rotate(composite, 5.0, axes=(0, 1), reshape=False,
+                           mode='constant', cval=0.0, order=1)
+    aug_zoom  = _zoom_and_crop(composite, 1.08)
+    aug_trans = ndi.shift(composite, [0.08 * IMG_SIZE, 0.08 * IMG_SIZE, 0],
+                          mode='constant', cval=0.0, order=1)
+
+    fig, axes = plt.subplots(2, 7, figsize=(24.5, 7))
+
+    top_row = [
+        (raw_hu,     'Raw HU\n(no windowing)',      'gray', None),
+        (brain_w,    'Brain window\nWC 40 / WW 80',  'gray', (0, 1)),
+        (subdural_w, 'Subdural window\nWC 80 / WW 200', 'gray', (0, 1)),
+        (soft_w,     'Soft window\nWC 40 / WW 380',  'gray', (0, 1)),
+        (composite,  'RGB composite\n(model input)', None,   None),
+        (gt_mask,    'Ground truth\nmask',           'hot',  (0, 1)),
+        (overlay,    'Overlay\n(red = ICH)',         None,   None),
+    ]
+    for ax, (img, title, cmap, clim) in zip(axes[0], top_row):
+        if cmap and clim:
+            ax.imshow(img, cmap=cmap, vmin=clim[0], vmax=clim[1])
+        elif cmap:
+            ax.imshow(img, cmap=cmap)
+        else:
+            ax.imshow(np.clip(img, 0, 1))
+        ax.set_title(title, fontsize=9)
+        ax.axis('off')
+
+    bottom_row = [
+        (composite, 'Original\ncomposite'),
+        (aug_flip,  'Flip\n(p=0.5 in training)'),
+        (aug_rot,   'Rotate +5deg\n(p=0.5 in training)'),
+        (aug_zoom,  'Zoom +8%\n(p=0.5 in training)'),
+        (aug_trans, 'Translate +8%\n(p=0.5 in training)'),
+    ]
+    for ax, (img, title) in zip(axes[1][:5], bottom_row):
+        ax.imshow(np.clip(img, 0, 1))
+        ax.set_title(title, fontsize=9)
+        ax.axis('off')
+    axes[1][5].axis('off')
+    axes[1][6].axis('off')
+
+    plt.suptitle(
+        f'PhysioNet processing pipeline -- patient {demo_patient}, slice {demo_slice}\n'
+        f'raw HU -> windowing -> RGB composite -> ground truth -> overlay -> '
+        f'training-time augmentation (each applied independently, additive)',
+        fontsize=11)
+    plt.tight_layout()
+    pipeline_path = OUTPUT_DIR / f'pipeline_demo_{ts}.png'
+    plt.savefig(str(pipeline_path), dpi=120, bbox_inches='tight')
+    plt.close()
+    print(f"  Saved pipeline figure: {pipeline_path.name}", flush=True)
+
+    # also export each panel individually (e.g. for slides/report figures)
+    panel_dir = OUTPUT_DIR / f'pipeline_demo_{ts}_panels'
+    panel_dir.mkdir(exist_ok=True)
+    all_panels = [
+        ('01_raw_hu',          raw_hu,     'gray', None),
+        ('02_brain_window',    brain_w,    'gray', (0, 1)),
+        ('03_subdural_window', subdural_w, 'gray', (0, 1)),
+        ('04_soft_window',     soft_w,     'gray', (0, 1)),
+        ('05_composite',       composite,  None,   None),
+        ('06_ground_truth',    gt_mask,    'hot',  (0, 1)),
+        ('07_overlay',         overlay,    None,   None),
+        ('08_aug_original',    composite,  None,   None),
+        ('09_aug_flip',        aug_flip,   None,   None),
+        ('10_aug_rotate',      aug_rot,    None,   None),
+        ('11_aug_zoom',        aug_zoom,   None,   None),
+        ('12_aug_translate',   aug_trans,  None,   None),
+    ]
+    for name, img, cmap, clim in all_panels:
+        panel_path = panel_dir / f'{name}.png'
+        if cmap and clim:
+            plt.imsave(str(panel_path), img, cmap=cmap, vmin=clim[0], vmax=clim[1])
+        elif cmap:
+            plt.imsave(str(panel_path), img, cmap=cmap)
+        else:
+            plt.imsave(str(panel_path), np.clip(img, 0, 1))
+    print(f"  Saved {len(all_panels)} individual panels: {panel_dir.name}/", flush=True)
+
+
 # 3. GPU setup
 gpus = tf.config.list_physical_devices('GPU')
 print(f"\nGPUs available: {len(gpus)}", flush=True)
@@ -359,8 +489,6 @@ print("=" * 88, flush=True)
 
 
 # 7. save results CSV + figures
-ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-
 csv_path = OUTPUT_DIR / f'comparison_results_{ts}.csv'
 results_df.to_csv(str(csv_path))
 print(f"\nSaved results: {csv_path.name}", flush=True)
@@ -390,8 +518,9 @@ if MATPLOTLIB:
         ax.set_xlabel(label)
         ax.set_title(title)
         ax.invert_yaxis()
-        for bar, v in zip(bars, means):
-            ax.text(v + 0.01, bar.get_y() + bar.get_height() / 2,
+        for i, (bar, v) in enumerate(zip(bars, means)):
+            err = stds[i] if stds is not None else 0.0
+            ax.text(v + err + 0.01, bar.get_y() + bar.get_height() / 2,
                     f'{v:.3f}', va='center', fontsize=9)
     # hide the unused 6th subplot (2x3 grid, 5 metrics)
     axes.ravel()[-1].set_visible(False)

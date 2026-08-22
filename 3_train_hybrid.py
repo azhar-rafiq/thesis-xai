@@ -70,7 +70,7 @@ if not gpus:
 
 
 # ---- load CNN checkpoint ----
-CNN_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_cnn_20260605_05000_auc.keras')
+CNN_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_cnn_20260722-BD_nan_auc.keras')
 if not os.path.exists(CNN_CKPT):
     raise FileNotFoundError(f"CNN checkpoint not found: {CNN_CKPT}")
 print(f"\nLoading CNN: {os.path.basename(CNN_CKPT)}", flush=True)
@@ -95,7 +95,7 @@ class PositionEmbedding(tf.keras.layers.Layer):
                        'embed_dim':   self.embed.output_dim})
         return config
 
-VIT_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_vit_20260608-ZU_08740_auc.keras')
+VIT_CKPT = os.path.join(MODEL_EXPORT_DIR, 'rsna_vit_20260713-ET_08916_auc.keras')
 if not os.path.exists(VIT_CKPT):
     raise FileNotFoundError(f"ViT checkpoint not found: {VIT_CKPT}")
 print(f"Loading ViT:  {os.path.basename(VIT_CKPT)}", flush=True)

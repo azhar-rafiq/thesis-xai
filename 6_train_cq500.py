@@ -1,20 +1,20 @@
 """
-PhysioNet CT-ICH -- supervised U-Net segmentation
+Seg-CQ500 -- supervised U-Net segmentation
 encoder initialised from RSNA CNN checkpoint (step 1 pretrained weights).
-trains directly on PhysioNet pixel masks; no slice-level labels needed.
-Run via sbatch: sbatch 5_train_physionet_seg.sh
+trains directly on Seg-CQ500 pixel masks; all 51 patients are ICH-positive.
+Run via sbatch: sbatch 6_train_cq500.sh
 """
 
+import csv
 import gc
 import os
 import sys
 import datetime
 import numpy as np
-import pandas as pd
 import tensorflow as tf
 from tensorflow.keras import layers, optimizers, callbacks
 from pathlib import Path
-from sklearn.model_selection import GroupShuffleSplit
+from sklearn.model_selection import train_test_split
 from skimage.transform import resize
 from dotenv import load_dotenv
 
@@ -30,10 +30,8 @@ SEED = 20260605
 tf.random.set_seed(SEED)
 np.random.seed(SEED)
 
-PHYSIONET_DIR    = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/data/physionet.org/files/ct-ich/1.3.1')
-CT_DIR           = PHYSIONET_DIR / 'ct_scans'
-MASK_DIR         = PHYSIONET_DIR / 'masks'
-LABELS_CSV       = PHYSIONET_DIR / 'hemorrhage_diagnosis_raw_ct.csv'
+VOLUMES_DIR      = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/data/seg-cq500/Seg-CQ500/data/volumes')
+INFO_CSV         = VOLUMES_DIR / 'info.csv'
 MODEL_EXPORT_DIR = Path('/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/models')
 
 IMG_SIZE   = 256
@@ -42,7 +40,7 @@ EPOCHS     = 50
 LR         = 1e-4
 
 
-# ---- same windowing as 0_preprocess_rsna.py ----
+# ---- same windowing as all other steps ----
 WINDOWS = {
     'brain':    {'wc': 40,  'ww': 80},
     'subdural': {'wc': 80,  'ww': 200},
@@ -61,39 +59,32 @@ def hu_to_3channel(hu_slice):
     return resize(img, (IMG_SIZE, IMG_SIZE), anti_aliasing=True).astype(np.float32)
 
 
-# ---- load all slices for one patient ----
-def load_patient(patient_num):
-    ct_vol   = nib.load(str(CT_DIR   / f'{patient_num:03d}.nii')).get_fdata().astype(np.float32)
-    mask_vol = nib.load(str(MASK_DIR / f'{patient_num:03d}.nii')).get_fdata().astype(np.float32)
+def load_patient(patient_name):
+    """load one Seg-CQ500 patient; returns (xs, ys) lists over axial slices."""
+    patient_dir = VOLUMES_DIR / patient_name
+    ct_vol   = nib.load(str(patient_dir / 'CT.nii')).get_fdata().astype(np.float32)
+    mask_vol = nib.load(str(patient_dir / 'ICH_mask.nii.gz')).get_fdata().astype(np.float32)
     xs, ys = [], []
     for s in range(ct_vol.shape[2]):
         xs.append(hu_to_3channel(ct_vol[:, :, s]))
         mask = resize(mask_vol[:, :, s], (IMG_SIZE, IMG_SIZE), anti_aliasing=False)
-        ys.append((mask > 0.5).astype(np.float32)[..., np.newaxis])  # (256, 256, 1)
+        ys.append((mask > 0.5).astype(np.float32)[..., np.newaxis])
     return xs, ys
 
 
-# ---- load labels and list available patients ----
-labels_df   = pd.read_csv(LABELS_CSV)
-available   = sorted([int(p.stem) for p in CT_DIR.glob('*.nii')])
-labels_df   = labels_df[labels_df['PatientNumber'].isin(available)]
-patients    = labels_df['PatientNumber'].unique()
+# ---- read patient list from info.csv ----
+with open(INFO_CSV, newline='') as f:
+    rows = list(csv.DictReader(f))
+all_patients = [r['name'] for r in rows]
 
-ich_count = (labels_df.groupby('PatientNumber')
-             [['Intraventricular', 'Intraparenchymal', 'Subarachnoid', 'Epidural', 'Subdural']]
-             .max().max(axis=1) > 0).sum()
-print(f"PhysioNet: {len(patients)} patients ({ich_count} with ICH), {len(labels_df)} slices", flush=True)
+print(f"Seg-CQ500: {len(all_patients)} patients (all ICH-positive)", flush=True)
 
-
-# ---- patient-level 80/20 split ----
-gss = GroupShuffleSplit(n_splits=1, test_size=0.2, random_state=SEED)
-train_idx, test_idx = next(gss.split(labels_df, groups=labels_df['PatientNumber']))
-train_patients = labels_df.iloc[train_idx]['PatientNumber'].unique()
-test_patients  = labels_df.iloc[test_idx]['PatientNumber'].unique()
+train_patients, test_patients = train_test_split(
+    all_patients, test_size=0.2, random_state=SEED)
 print(f"Split -- train: {len(train_patients)} patients, test: {len(test_patients)} patients", flush=True)
 
 
-# ---- load splits into RAM (small dataset, ~2 GB total) ----
+# ---- load splits into RAM ----
 def load_split(patient_list, split_name):
     xs, ys = [], []
     for p in patient_list:
@@ -137,12 +128,11 @@ print(f"  CNN layers: {len(cnn_base.layers)}", flush=True)
 # ---- build U-Net segmenter on top of CNN encoder ----
 def build_unet_segmenter(cnn_base, freeze_encoder=True):
     """
-    same skip-connection U-Net as 4_segmentation_xai.py but outputs
-    a single binary mask (256, 256, 1) trained with pixel-level supervision.
+    same skip-connection U-Net as step 5 (physionet) but with Seg-CQ500 data.
+    outputs a single binary mask (256, 256, 1) trained with pixel-level supervision.
     """
     cnn_base.trainable = not freeze_encoder
 
-    # CNN is a Sequential model; trace through layers functionally to get skip tensors
     inp = layers.Input(shape=(IMG_SIZE, IMG_SIZE, 3), name='input')
     x   = inp
     act_outputs  = []
@@ -162,7 +152,6 @@ def build_unet_segmenter(cnn_base, freeze_encoder=True):
     skip3      = act_outputs[2]   # (64,  64,  filters3)
     bottleneck = drop_outputs[2]  # (32,  32,  filters3)
 
-    # decoder: 32x32 -> 64x64 -> 128x128 -> 256x256
     xd = layers.Conv2DTranspose(128, (2, 2), strides=(2, 2), padding='same', name='dec_up1')(bottleneck)
     xd = layers.Concatenate(name='dec_cat1')([xd, skip3])
     xd = layers.Conv2D(128, (3, 3), padding='same', name='dec_conv1')(xd)
@@ -182,7 +171,7 @@ def build_unet_segmenter(cnn_base, freeze_encoder=True):
     xd = layers.Activation('relu', name='dec_act3')(xd)
 
     output = layers.Conv2D(1, (1, 1), activation='sigmoid', name='seg_output')(xd)
-    return tf.keras.Model(inputs=inp, outputs=output, name='unet_physionet')
+    return tf.keras.Model(inputs=inp, outputs=output, name='unet_cq500')
 
 
 tf.keras.backend.clear_session()
@@ -191,7 +180,7 @@ trainable = sum(int(np.prod(v.shape)) for v in unet.trainable_variables)
 print(f"Trainable params: {trainable:,}  (encoder frozen)", flush=True)
 
 
-# ---- loss: BCE + Dice handles sparse positive pixels ----
+# ---- loss: BCE + Dice ----
 def dice_coef(y_true, y_pred, smooth=1.0):
     y_true_f = tf.reshape(tf.cast(y_true, tf.float32), [-1])
     y_pred_f = tf.reshape(y_pred, [-1])
@@ -223,15 +212,14 @@ def dice_positive_only(y_true, y_pred, smooth=1.0):
 unet.compile(
     optimizer=optimizers.Adam(learning_rate=LR),
     loss=bce_dice_loss,
-    metrics=[dice_coef, dice_per_image, dice_positive_only],
+    metrics=[dice_coef,dice_per_image,dice_positive_only],
 )
 
 
-# ---- TF dataset with augmentation (train only) ----
+# ---- TF dataset ----
 @tf.function
 def augment(img, mask):
-    # concat so the same spatial transform hits both image and mask
-    combined = tf.concat([img, mask], axis=-1)                      # (256, 256, 4)
+    combined = tf.concat([img, mask], axis=-1)
     combined = tf.image.random_flip_left_right(combined, seed=SEED)
     # combined = tf.image.random_flip_up_down(combined, seed=SEED) #cancelled
     return combined[..., :3], combined[..., 3:]
@@ -248,9 +236,9 @@ test_ds  = make_dataset(x_test,  y_test,  shuffle=False)
 
 # ---- train ----
 ts        = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-ckpt_path = str(MODEL_EXPORT_DIR / f'physionet_unet_{ts}.keras')
+ckpt_path = str(MODEL_EXPORT_DIR / f'cq500_unet_{ts}.keras')
 
-print(f"\nTraining PhysioNet U-Net (encoder frozen)...", flush=True)
+print(f"\nTraining Seg-CQ500 U-Net (encoder frozen)...", flush=True)
 train_started = datetime.datetime.now()
 unet.fit(
     train_ds,
@@ -262,7 +250,7 @@ unet.fit(
         callbacks.ReduceLROnPlateau(monitor='val_dice_positive_only', factor=0.5, patience=5,
                                     mode='max', min_lr=1e-6),
         callbacks.ModelCheckpoint(filepath=ckpt_path, monitor='val_dice_positive_only',
-                                   mode='max', save_best_only=True, verbose=1),
+                                  mode='max', save_best_only=True, verbose=1),
     ],
 )
 total = datetime.datetime.now() - train_started
@@ -271,8 +259,8 @@ print(f"Training complete. ({int(total.total_seconds() // 60)} min)", flush=True
 
 # ---- evaluate ----
 print("\nTest set evaluation...", flush=True)
-y_pred      = unet.predict(test_ds)
-y_pred_bin  = (y_pred > 0.5).astype(np.float32)
+y_pred     = unet.predict(test_ds)
+y_pred_bin = (y_pred > 0.5).astype(np.float32)
 
 def seg_metrics(y_true, y_pred_bin):
     yt = y_true.ravel().astype(np.float32)
@@ -287,20 +275,19 @@ def seg_metrics(y_true, y_pred_bin):
 dice, iou, rec, prec = seg_metrics(y_test, y_pred_bin)
 print(f"  all test slices:       Dice {dice:.4f}  IoU {iou:.4f}  Recall {rec:.4f}  Precision {prec:.4f}")
 
-# positive slices only (more meaningful -- negative slices trivially score high)
 pos_mask = y_test.max(axis=(1, 2, 3)) > 0
 if pos_mask.sum() > 0:
     d, i, r, p = seg_metrics(y_test[pos_mask], y_pred_bin[pos_mask])
     print(f"  positive slices ({pos_mask.sum():>3}): Dice {d:.4f}  IoU {i:.4f}  Recall {r:.4f}  Precision {p:.4f}")
 
 
-# ---- save outputs for comparison in step 6 ----
-maps_path = str(MODEL_EXPORT_DIR / f'physionet_seg_maps_{ts}.npy')
-idx_path  = str(MODEL_EXPORT_DIR / f'physionet_test_patients_{ts}.npy')
+# ---- save outputs for step 7 ----
+maps_path = str(MODEL_EXPORT_DIR / f'cq500_seg_maps_{ts}.npy')
+idx_path  = str(MODEL_EXPORT_DIR / f'cq500_test_patients_{ts}.npy')
 
 np.save(maps_path, y_pred.astype('float16'))
-np.save(idx_path,  test_patients)
-print(f"\nSaved seg maps:    physionet_seg_maps_{ts}.npy    shape: {y_pred.shape}", flush=True)
-print(f"Saved test patients: physionet_test_patients_{ts}.npy", flush=True)
+np.save(idx_path,  np.array(test_patients))
+print(f"\nSaved seg maps:     cq500_seg_maps_{ts}.npy    shape: {y_pred.shape}", flush=True)
+print(f"Saved test patients: cq500_test_patients_{ts}.npy", flush=True)
 
 print("\nDone!")

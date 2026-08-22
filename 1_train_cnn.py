@@ -11,6 +11,7 @@ import random
 import datetime
 import types
 import numpy as np
+import scipy.ndimage as ndi
 import tensorflow as tf
 from collections import defaultdict
 from tensorflow.keras import models, layers, optimizers, callbacks
@@ -33,6 +34,55 @@ SEED       = 20260605
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+
+# additive augmentation: each transform is applied independently with this probability,
+# creating one extra copy of the image per applied transform (original always kept).
+# expected pool size per original = 1 + sum(probs)
+AUG_FLIP_PROB     = 0.5    # probability of adding a horizontally flipped copy
+AUG_ROT_PROB      = 0.5    # probability of adding a rotated copy
+AUG_ZOOM_PROB     = 0.5    # probability of adding a zoomed copy
+AUG_TRANS_PROB    = 0.5    # probability of adding a translated copy
+AUG_ROT_DEG       = 5.0    # max rotation magnitude in degrees
+AUG_ZOOM_PCT      = 0.08   # max zoom magnitude as fraction of image size
+AUG_TRANS_PCT     = 0.08   # max translation magnitude as fraction of image size
+AUG_EXPECTED_MULT = 1.0 + AUG_FLIP_PROB + AUG_ROT_PROB + AUG_ZOOM_PROB + AUG_TRANS_PROB
+
+
+def _zoom_and_crop(img, factor):
+    """zoom img by factor then center-crop or center-pad back to original shape."""
+    h, w = img.shape[:2]
+    zoomed = ndi.zoom(img, [factor, factor, 1.0], mode='constant', cval=0.0, order=1)
+    zh, zw = zoomed.shape[:2]
+    if factor >= 1.0:
+        y0 = (zh - h) // 2
+        x0 = (zw - w) // 2
+        return zoomed[y0:y0 + h, x0:x0 + w, :]
+    else:
+        result = np.zeros_like(img)
+        py = (h - zh) // 2
+        px = (w - zw) // 2
+        result[py:py + zh, px:px + zw, :] = zoomed
+        return result
+
+
+def _augment_variants(xi):
+    """stochastically generate augmented copies of xi; does not include the original."""
+    variants = []
+    if np.random.random() < AUG_FLIP_PROB:
+        variants.append(np.flip(xi, axis=1).copy())
+    if np.random.random() < AUG_ROT_PROB:
+        angle = np.random.uniform(-AUG_ROT_DEG, AUG_ROT_DEG)
+        variants.append(ndi.rotate(xi, angle, axes=(0, 1), reshape=False,
+                                   mode='constant', cval=0.0, order=1).astype('float32'))
+    if np.random.random() < AUG_ZOOM_PROB:
+        factor = 1.0 + np.random.uniform(-AUG_ZOOM_PCT, AUG_ZOOM_PCT)
+        variants.append(_zoom_and_crop(xi, factor).astype('float32'))
+    if np.random.random() < AUG_TRANS_PROB:
+        dy = np.random.uniform(-AUG_TRANS_PCT, AUG_TRANS_PCT) * xi.shape[0]
+        dx = np.random.uniform(-AUG_TRANS_PCT, AUG_TRANS_PCT) * xi.shape[1]
+        variants.append(ndi.shift(xi, [dy, dx, 0], mode='constant', cval=0.0,
+                                  order=1).astype('float32'))
+    return variants
 
 CACHE_DIR  = Path(os.getenv('KAGGLE_CACHE')) / 'preprocessed'
 IMG_SIZE   = 256
@@ -80,7 +130,7 @@ class DataStreamKerasClassifier(KerasClassifier):
     # so use model.fit(dataset) with from_generator to stream one batch at a time.
 
     @staticmethod
-    def _make_dataset(X, y, sample_weight, batch_size, shuffle):
+    def _make_dataset(X, y, sample_weight, batch_size, shuffle, augment=False):
         n = len(X)
         # tell TF the shape and dtype of each sample before batching
         y_shape = (y.shape[1],) if y.ndim > 1 else ()
@@ -92,15 +142,23 @@ class DataStreamKerasClassifier(KerasClassifier):
             sig += (tf.TensorSpec(shape=(), dtype=tf.float32),)
 
         def gen():
-            # convert numpy array into an infinite stream of (image, label) pairs that will be pulled by TF one at a time
+            # stream (image, label) pairs; when augment=True, each original is followed
+            # by stochastically generated copies that grow the effective training pool.
             while True:
                 for i in range(n):
                     xi = X[i].astype('float32')
                     yi = y[i].astype('float32')
                     if sample_weight is not None:
-                        yield xi, yi, sample_weight[i].astype('float32')
+                        sw = sample_weight[i].astype('float32')
+                        yield xi, yi, sw
+                        if augment:
+                            for aug_xi in _augment_variants(xi):
+                                yield aug_xi, yi, sw
                     else:
                         yield xi, yi
+                        if augment:
+                            for aug_xi in _augment_variants(xi):
+                                yield aug_xi, yi
 
         # docs from_generator: https://www.tensorflow.org/api_docs/python/tf/data/Dataset#from_generator
         ds = tf.data.Dataset.from_generator(gen, output_signature=sig)
@@ -111,10 +169,12 @@ class DataStreamKerasClassifier(KerasClassifier):
 
     def _fit_keras_model(self, X, y, sample_weight, warm_start, epochs, initial_epoch, **kwargs):
         batch_size = self.get_params().get('batch_size', 32)
-        steps_per_epoch = int(np.ceil(len(X) / batch_size))
-        print(f"[fold] starting new fold: {len(X)} samples, {epochs} epochs, batch_size={batch_size}", flush=True)
+        # steps_per_epoch accounts for the expected pool expansion from additive augmentation
+        steps_per_epoch = int(np.ceil(len(X) * AUG_EXPECTED_MULT / batch_size))
+        print(f"[fold] starting new fold: {len(X)} samples, {epochs} epochs, "
+              f"batch_size={batch_size}, aug_mult={AUG_EXPECTED_MULT:.1f}", flush=True)
 
-        train_ds = self._make_dataset(X, y, sample_weight, batch_size, shuffle=True)
+        train_ds = self._make_dataset(X, y, sample_weight, batch_size, shuffle=True, augment=True)
 
         val_data = kwargs.pop('validation_data', None)
         val_steps = None
@@ -153,20 +213,9 @@ def getModel(filters1=16, filters2=32, filters3=64,
     cnn = models.Sequential()
     cnn.add(layers.Input(img_dimension))
 
-    # augmentation
-    # fill_mode='constant' keeps background black (0), matching CT convention.
-    # brain is bilaterally symmetric -> horizontal flip valid.
-    # +/-5 deg rotation, +/-8% zoom/translation account for scanner/positioning variance.
-
-    # docs RandomFlip: https://www.tensorflow.org/api_docs/python/tf/keras/layers/RandomFlip
-    # docs RandomRotation: https://www.tensorflow.org/api_docs/python/tf/keras/layers/RandomRotation
-    # docs RandomZoom: https://www.tensorflow.org/api_docs/python/tf/keras/layers/RandomZoom
-    # docs RandomTranslation: https://www.tensorflow.org/api_docs/python/tf/keras/layers/RandomTranslation
-
-    cnn.add(layers.RandomFlip('horizontal'))
-    cnn.add(layers.RandomRotation(factor=5/360, fill_mode='constant'))
-    cnn.add(layers.RandomZoom(height_factor=0.08, width_factor=0.08, fill_mode='constant'))
-    cnn.add(layers.RandomTranslation(height_factor=0.08, width_factor=0.08, fill_mode='constant'))
+    # augmentation is handled additively in the data generator (_augment_variants):
+    # each original image stochastically produces extra copies (flip/rotation/zoom/translation),
+    # growing the training pool rather than replacing originals in-place.
 
     cnn.add(layers.Conv2D(filters=filters1, kernel_size=(3, 3), padding='same'))
     cnn.add(layers.BatchNormalization())
@@ -203,7 +252,7 @@ def getModel(filters1=16, filters2=32, filters3=64,
 
 
 # if the best parameter found, skip grid will set to True
-SKIP_GRID_SEARCH = False
+SKIP_GRID_SEARCH = True
 
 if not SKIP_GRID_SEARCH:
     # only use 3% of subsample
@@ -307,11 +356,11 @@ best_model = getModel(**model_kwargs)  # clear_session inside frees last CV fold
 
 n_train     = len(x_train)
 n_val       = len(x_val)
-train_steps = int(np.ceil(n_train / best_batch_size))
+train_steps = int(np.ceil(n_train * AUG_EXPECTED_MULT / best_batch_size))
 val_steps   = int(np.ceil(n_val   / best_batch_size))
 
 train_ds = DataStreamKerasClassifier._make_dataset(
-    x_train, y_train, None, best_batch_size, shuffle=True)
+    x_train, y_train, None, best_batch_size, shuffle=True, augment=True)
 val_ds   = DataStreamKerasClassifier._make_dataset(
     x_val, y_val, None, best_batch_size, shuffle=False)
 

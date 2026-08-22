@@ -11,6 +11,7 @@ import random
 import datetime
 import types
 import numpy as np
+import scipy.ndimage as ndi
 import tensorflow as tf
 from collections import defaultdict
 from tensorflow.keras import models, layers, optimizers, callbacks
@@ -30,6 +31,53 @@ SEED       = 20260605
 random.seed(SEED)
 np.random.seed(SEED)
 tf.random.set_seed(SEED)
+
+# additive augmentation: each transform applied independently, creating extra copies (original always kept)
+AUG_FLIP_PROB     = 0.5
+AUG_ROT_PROB      = 0.5
+AUG_ZOOM_PROB     = 0.5
+AUG_TRANS_PROB    = 0.5
+AUG_ROT_DEG       = 5.0
+AUG_ZOOM_PCT      = 0.08
+AUG_TRANS_PCT     = 0.08
+AUG_EXPECTED_MULT = 1.0 + AUG_FLIP_PROB + AUG_ROT_PROB + AUG_ZOOM_PROB + AUG_TRANS_PROB
+
+
+def _zoom_and_crop(img, factor):
+    h, w = img.shape[:2]
+    zoomed = ndi.zoom(img, [factor, factor, 1.0], mode='constant', cval=0.0, order=1)
+    zh, zw = zoomed.shape[:2]
+    if factor >= 1.0:
+        y0 = (zh - h) // 2
+        x0 = (zw - w) // 2
+        return zoomed[y0:y0 + h, x0:x0 + w, :]
+    else:
+        result = np.zeros_like(img)
+        py = (h - zh) // 2
+        px = (w - zw) // 2
+        result[py:py + zh, px:px + zw, :] = zoomed
+        return result
+
+
+def _augment_variants(xi):
+    """stochastically generate augmented copies of xi; does not include the original."""
+    variants = []
+    if np.random.random() < AUG_FLIP_PROB:
+        variants.append(np.flip(xi, axis=1).copy())
+    if np.random.random() < AUG_ROT_PROB:
+        angle = np.random.uniform(-AUG_ROT_DEG, AUG_ROT_DEG)
+        variants.append(ndi.rotate(xi, angle, axes=(0, 1), reshape=False,
+                                   mode='constant', cval=0.0, order=1).astype('float32'))
+    if np.random.random() < AUG_ZOOM_PROB:
+        factor = 1.0 + np.random.uniform(-AUG_ZOOM_PCT, AUG_ZOOM_PCT)
+        variants.append(_zoom_and_crop(xi, factor).astype('float32'))
+    if np.random.random() < AUG_TRANS_PROB:
+        dy = np.random.uniform(-AUG_TRANS_PCT, AUG_TRANS_PCT) * xi.shape[0]
+        dx = np.random.uniform(-AUG_TRANS_PCT, AUG_TRANS_PCT) * xi.shape[1]
+        variants.append(ndi.shift(xi, [dy, dx, 0], mode='constant', cval=0.0,
+                                  order=1).astype('float32'))
+    return variants
+
 
 CACHE_DIR  = Path(os.getenv('KAGGLE_CACHE')) / 'preprocessed'
 IMG_SIZE   = 256
@@ -87,41 +135,32 @@ class DataStreamKerasClassifier(KerasClassifier):
             sig += (tf.TensorSpec(shape=(), dtype=tf.float32),)
 
         def gen():
-            # sequential NFS reads avoid random mmap seeks; shuffle buffer randomises at sample level
+            # sequential NFS reads avoid random mmap seeks; shuffle buffer randomises at sample level.
+            # when augment=True each original is followed by stochastic copies that grow the pool.
             while True:
                 for i in range(n):
                     xi = X[i].astype('float32')
                     yi = y[i].astype('float32')
                     if sample_weight is not None:
-                        yield xi, yi, sample_weight[i].astype('float32')
+                        sw = sample_weight[i].astype('float32')
+                        yield xi, yi, sw
+                        if augment:
+                            for aug_xi in _augment_variants(xi):
+                                yield aug_xi, yi, sw
                     else:
                         yield xi, yi
+                        if augment:
+                            for aug_xi in _augment_variants(xi):
+                                yield aug_xi, yi
 
         ds = tf.data.Dataset.from_generator(gen, output_signature=sig)
         if shuffle:
             ds = ds.shuffle(buffer_size=10000)
-        ds = ds.batch(batch_size)
-
-        if augment:
-            # matches CNN augmentation: ±5 deg rotation and ±8% zoom/translation for scanner variance
-            augmenter = tf.keras.Sequential([
-                layers.RandomFlip("horizontal"),
-                layers.RandomRotation(factor=5/360, fill_mode='constant'),
-                layers.RandomZoom(height_factor=0.08, width_factor=0.08, fill_mode='constant'),
-                layers.RandomTranslation(height_factor=0.08, width_factor=0.08, fill_mode='constant'),
-            ])
-            if sample_weight is not None:
-                ds = ds.map(lambda x, y, w: (augmenter(x, training=True), y, w),
-                            num_parallel_calls=tf.data.AUTOTUNE)
-            else:
-                ds = ds.map(lambda x, y: (augmenter(x, training=True), y),
-                            num_parallel_calls=tf.data.AUTOTUNE)
-
-        return ds.prefetch(tf.data.AUTOTUNE)
+        return ds.batch(batch_size).prefetch(tf.data.AUTOTUNE)
 
     def _fit_keras_model(self, X, y, sample_weight, warm_start, epochs, initial_epoch, **kwargs):
         batch_size      = self.get_params().get('batch_size', 32)
-        steps_per_epoch = int(np.ceil(len(X) / batch_size))
+        steps_per_epoch = int(np.ceil(len(X) * AUG_EXPECTED_MULT / batch_size))
 
         train_ds = self._make_dataset(X, y, sample_weight, batch_size, shuffle=True, augment=True)
 
@@ -213,7 +252,7 @@ def getModel(patch_size=16, embed_dim=64, num_heads=4,
 
 
 # set True to skip grid search and reuse hardcoded best params from a prior run
-SKIP_GRID_SEARCH = False
+SKIP_GRID_SEARCH = True
 
 if not SKIP_GRID_SEARCH:
     # 3% subsample keeps per-fold memory low so accumulated folds stay within node budget
@@ -286,7 +325,7 @@ if not SKIP_GRID_SEARCH:
     gc.collect()
 
 else:
-    # update these after the first successful grid search run
+    # from grid search run on job 46809230 (best CV score 0.8916)
     _best = {
         'clf__batch_size':           64,
         'clf__epochs':               30,
@@ -294,11 +333,11 @@ else:
         'clf__model__embed_dim':     128,
         'clf__model__num_heads':     4,
         'clf__model__num_blocks':    4,
-        'clf__model__mlp_dim':       256,
+        'clf__model__mlp_dim':       128,
         'clf__model__lr':            0.0001,
         'clf__model__dropoutrate':   0.1,
     }
-    grid = types.SimpleNamespace(best_params_=_best, best_score_=float('nan'))
+    grid = types.SimpleNamespace(best_params_=_best, best_score_=0.8916)
     print(f"Skipping grid search, using hardcoded params: {_best}", flush=True)
 
 # build best model directly, bypassing scikeras to avoid allocating train and val arrays as TF constants
@@ -312,7 +351,7 @@ best_model = getModel(**model_kwargs)
 
 n_train     = len(x_train)
 n_val       = len(x_val)
-train_steps = int(np.ceil(n_train / best_batch_size))
+train_steps = int(np.ceil(n_train * AUG_EXPECTED_MULT / best_batch_size))
 val_steps   = int(np.ceil(n_val   / best_batch_size))
 
 train_ds = DataStreamKerasClassifier._make_dataset(
@@ -325,6 +364,14 @@ MODEL_EXPORT_DIR = '/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/mod
 os.makedirs(MODEL_EXPORT_DIR, exist_ok=True)
 checkpoint_path = os.path.join(MODEL_EXPORT_DIR,
     f'vit_checkpoint_{datetime.datetime.now().strftime("%Y%m%d_%H%M%S")}.keras')
+
+# resume weights from the most recent checkpoint (e.g. after a walltime-killed rerun with SKIP_GRID_SEARCH=True)
+if SKIP_GRID_SEARCH:
+    prior_checkpoints = sorted(Path(MODEL_EXPORT_DIR).glob('vit_checkpoint_*.keras'))
+    if prior_checkpoints:
+        resume_from = prior_checkpoints[-1]
+        print(f"Resuming weights from checkpoint: {resume_from.name}", flush=True)
+        best_model.load_weights(resume_from)
 
 total_steps  = train_steps * best_epochs
 warmup_steps = max(1, int(0.1 * total_steps))
