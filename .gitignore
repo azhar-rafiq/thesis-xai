@@ -1,14 +1,14 @@
 thesis-venv/
 model-exported/
 backup/
-result/
+!result/*
 .env
 *.out
 *.stats
 *.h5
-*.png
+# *.png
 *.pkl
-*.csv 
+# *.csv 
 *.npz
 *.log
 *.pyc

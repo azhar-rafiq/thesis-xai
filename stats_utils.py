@@ -99,7 +99,7 @@ def apply_style():
         'text.color':        INK,
         'legend.frameon':    False,
         'lines.linewidth':   2.0,
-        'font.size':         9,
+        'font.size':         10,
     })
 
 
@@ -292,16 +292,6 @@ def rank_biserial(a, b):
     return float((r[d > 0].sum() - r[d < 0].sum()) / r.sum())
 
 
-def cliffs_delta(a, b):
-    """effect size for two independent samples, paired with mann-whitney u."""
-    a = np.asarray(a, dtype=float)
-    b = np.asarray(b, dtype=float)
-    if a.size == 0 or b.size == 0:
-        return float('nan')
-    u = sps.mannwhitneyu(a, b, alternative='two-sided').statistic
-    return float(2.0 * u / (a.size * b.size) - 1.0)
-
-
 def mcnemar_exact(hits_a, hits_b):
     """exact binomial mcnemar test on paired binary outcomes."""
     a = np.asarray(hits_a).astype(int).ravel()
@@ -354,6 +344,9 @@ def save_bundle(path, bundle):
         flat[f'ext{SEP}{ds}{SEP}y_any']       = np.asarray(d['y_any'], dtype=np.int8)
         flat[f'ext{SEP}{ds}{SEP}patient']     = np.array([str(p) for p in d['patient']])
         flat[f'ext{SEP}{ds}{SEP}pos_patient'] = np.array([str(p) for p in d['pos_patient']])
+        if 'pg_chance' in d:
+            flat[f'ext{SEP}{ds}{SEP}pg_chance'] = np.asarray(
+                [d['pg_chance']['analytic'], d['pg_chance']['empirical']], dtype=np.float64)
         for model, sc in d['scores'].items():
             flat[f'ext{SEP}{ds}{SEP}score{SEP}{model}'] = np.asarray(sc, dtype=np.float32)
         for method, mets in d['seg'].items():
@@ -391,6 +384,10 @@ def load_bundle(path):
             'scores':      {k.split(SEP)[-1]: z[k] for k in z.files if k.startswith(pre + f'score{SEP}')},
             'seg':         seg,
         }
+        if pre + 'pg_chance' in z.files:
+            a, e = z[pre + 'pg_chance']
+            bundle['external'][ds]['pg_chance'] = {'analytic': float(a),
+                                                   'empirical': float(e)}
     return bundle
 
 
@@ -590,74 +587,22 @@ def seg_descriptive_table(bundle, n_boot=2000, seed=0):
     return pd.DataFrame(rows)
 
 
-def friedman_table(bundle, skip=('pg',)):
-    """omnibus test across all methods, paired by slice, per dataset and metric."""
+def chance_reference_table(bundle):
+    """pointing game expectation under a uniformly random peak, per dataset."""
     rows = []
     for ds in order_datasets(bundle.get('external', {})):
         d = bundle['external'][ds]
-        methods = order_methods(list(d['seg']))
-        if len(methods) < 3:
+        pg = d.get('pg_chance')
+        if not pg:
             continue
-        for mname in SEG_METRICS:
-            if mname in skip:
-                continue   # binary at slice level, handled by mcnemar and cochran q
-            cols = [np.asarray(d['seg'][m][mname], dtype=float)
-                    for m in methods if mname in d['seg'][m]]
-            if len(cols) < 3:
-                continue
-            # identical columns leave the friedman denominator at zero, which scipy
-            # returns as nan after a RuntimeWarning. happens at patient level when
-            # no method ever scores on the metric.
-            if all(np.array_equal(c, cols[0]) for c in cols[1:]):
-                stat, p = float('nan'), float('nan')
-            else:
-                stat, p = sps.friedmanchisquare(*cols)
-            rows.append({'dataset': ds, 'metric': mname, 'n_methods': len(cols),
-                         'n_slices': cols[0].size, 'chi2': float(stat),
-                         'df': len(cols) - 1, 'p_raw': float(p)})
-    df = pd.DataFrame(rows)
-    return add_holm(df, ['dataset']) if not df.empty else df
-
-
-def cochran_q(mat):
-    """
-    omnibus for three or more paired binary outcomes, the binary counterpart of
-    friedman. hand-coded because statsmodels is not in the thesis venv.
-
-    mat is (n_subjects, k_methods) of 0/1.
-    """
-    m       = np.asarray(mat, dtype=float)
-    n, k    = m.shape
-    col     = m.sum(axis=0)
-    row     = m.sum(axis=1)
-    tot     = float(m.sum())
-    denom   = k * tot - float((row ** 2).sum())
-    if k < 2 or n == 0 or denom <= 0:
-        # every subject agrees across all methods, so there is nothing to test
-        return float('nan'), k - 1, float('nan')
-    q = (k - 1) * (k * float((col ** 2).sum()) - tot ** 2) / denom
-    return float(q), k - 1, float(sps.chi2.sf(q, k - 1))
-
-
-def cochran_q_table(bundle, metric='pg'):
-    """omnibus across all methods on the binary pointing game, paired by slice."""
-    rows = []
-    for ds in order_datasets(bundle.get('external', {})):
-        d       = bundle['external'][ds]
-        methods = [m for m in order_methods(list(d['seg'])) if metric in d['seg'][m]]
-        if len(methods) < 3:
-            continue
-        mat = np.column_stack([np.asarray(d['seg'][m][metric], dtype=float) > 0.5
-                               for m in methods]).astype(float)
-        q, dof, p = cochran_q(mat)
+        n_pos = len(np.asarray(d['pos_patient']))
         rows.append({
-            'unit': 'slice', 'dataset': ds, 'metric': 'pointing_game',
-            'n_methods': len(methods), 'n_slices': int(mat.shape[0]),
-            'hits': ' '.join(f'{m}={int(mat[:, i].sum())}' for i, m in enumerate(methods)),
-            'Q': q, 'df': dof, 'p_raw': p,
+            'dataset': ds, 'n_pos_slices': n_pos,
+            'pg_chance_analytic':  float(pg['analytic']),
+            'pg_chance_empirical': float(pg['empirical']),
+            'expected_hits': float(pg['analytic']) * n_pos,
         })
-    df = pd.DataFrame(rows)
-    return add_holm(df, ['dataset']) if not df.empty else df
+    return pd.DataFrame(rows)
 
 
 def wilcoxon_table(bundle, skip=('pg',)):
@@ -681,6 +626,7 @@ def wilcoxon_table(bundle, skip=('pg',)):
                     stat, p = float(res.statistic), float(res.pvalue)
                 rows.append({
                     'dataset': ds, 'metric': mname, 'method_a': a, 'method_b': b,
+                    'n': int(va.size),
                     'mean_a': float(va.mean()), 'mean_b': float(vb.mean()),
                     'median_diff': float(np.median(va - vb)),
                     'W': stat, 'p_raw': p, 'effect_rank_biserial': rank_biserial(va, vb),
@@ -709,37 +655,10 @@ def mcnemar_table(bundle):
     return add_holm(df, ['dataset']) if not df.empty else df
 
 
-def cross_dataset_table(bundle, skip=('pg',)):
-    """same method on two datasets, independent samples, so mann-whitney u."""
-    rows = []
-    ext = bundle.get('external', {})
-    for ds_a, ds_b in itertools.combinations(order_datasets(ext), 2):
-        shared = [m for m in order_methods(list(ext[ds_a]['seg']))
-                  if m in ext[ds_b]['seg']]
-        for method in shared:
-            for mname in SEG_METRICS:
-                if mname in skip:
-                    continue
-                if mname not in ext[ds_a]['seg'][method] or mname not in ext[ds_b]['seg'][method]:
-                    continue
-                va = np.asarray(ext[ds_a]['seg'][method][mname], dtype=float)
-                vb = np.asarray(ext[ds_b]['seg'][method][mname], dtype=float)
-                res = sps.mannwhitneyu(va, vb, alternative='two-sided')
-                rows.append({
-                    'dataset_a': ds_a, 'dataset_b': ds_b, 'method': method, 'metric': mname,
-                    'mean_a': float(va.mean()), 'mean_b': float(vb.mean()),
-                    'diff': float(va.mean() - vb.mean()),
-                    'U': float(res.statistic), 'p_raw': float(res.pvalue),
-                    'effect_cliffs_delta': cliffs_delta(va, vb),
-                })
-    df = pd.DataFrame(rows)
-    return add_holm(df, ['metric']) if not df.empty else df
-
-
 # ---------------------------------------------------------------------------
 # figures
 # ---------------------------------------------------------------------------
-def _finish(fig, path, dpi=150):
+def _finish(fig, path, dpi=300):
     fig.savefig(str(path), dpi=dpi, bbox_inches='tight')
     plt.close(fig)
     return path
@@ -754,7 +673,7 @@ def fig_rsna_roc(bundle, path):
     cols   = rsna['label_cols']
     models = order_methods(list(rsna['probs']))
 
-    fig, axes = plt.subplots(2, 3, figsize=(13, 8.5))
+    fig, axes = plt.subplots(2, 3, figsize=(9.6, 6.3))
     panels = list(enumerate(cols)) + [(None, 'micro average')]
     for ax, (i, title) in zip(axes.ravel(), panels):
         for model in models:
@@ -793,7 +712,7 @@ def fig_rsna_auc_dots(auc_df, path):
     targets = list(dict.fromkeys(d['target']))
     models  = order_methods(list(dict.fromkeys(d['model'])))
 
-    fig, ax = plt.subplots(figsize=(9, 1.25 * len(targets) + 2.0))
+    fig, ax = plt.subplots(figsize=(6.7, 0.95 * len(targets) + 1.6))
     yb   = np.arange(len(targets))
     off  = np.linspace(-0.26, 0.26, len(models))
     by_m = {m: d[d['model'] == m].set_index('target') for m in models}
@@ -834,7 +753,7 @@ def fig_external_curves(bundle, path, kind='roc'):
     if not ext:
         return None
     names = order_datasets(ext)
-    fig, axes = plt.subplots(1, len(names), figsize=(6.2 * len(names), 5.2), squeeze=False)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.8 * len(names), 4.2), squeeze=False)
     for ax, ds in zip(axes[0], names):
         d = ext[ds]
         y = np.asarray(d['y_any']).astype(int)
@@ -883,7 +802,7 @@ def fig_auc_forest(auc_df, path):
                                    if v in METHOD_ORDER else 99)
     d = d.sort_values(['_ds_rank', '_m_rank'])
 
-    fig, ax = plt.subplots(figsize=(9, 0.42 * len(d) + 2.2))
+    fig, ax = plt.subplots(figsize=(6.7, 0.34 * len(d) + 1.8))
     ys = np.arange(len(d))[::-1]
     for y, (_, r) in zip(ys, d.iterrows()):
         lo = r['auc'] - r['ci_lo'] if np.isfinite(r['ci_lo']) else 0.0
@@ -912,7 +831,7 @@ def fig_dice_distribution(bundle, path, metric='dice'):
     if not ext:
         return None
     names = order_datasets(ext)
-    fig, axes = plt.subplots(1, len(names), figsize=(5.6 * len(names), 5.0), squeeze=False)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.8 * len(names), 4.4), squeeze=False)
     for ax, ds in zip(axes[0], names):
         d       = ext[ds]
         methods = [m for m in order_methods(list(d['seg'])) if metric in d['seg'][m]]
@@ -944,20 +863,28 @@ def fig_dice_distribution(bundle, path, metric='dice'):
     return _finish(fig, path)
 
 
-def fig_pvalue_heatmap(wilcox_df, path, metric='dice'):
-    """holm-adjusted p-values for every method pair, values printed in-cell."""
-    # the table now carries both units; the heatmap is the slice-level one, and
-    # without this filter the patient rows overwrite the same matrix cells
+def fig_pvalue_heatmap(wilcox_df, path, metric='dice', unit='patient'):
+    """holm-adjusted p-values for every method pair, values printed in-cell.
+
+    The last row written overwrites the previous. Patient-level evaluation is
+    set as the default, because treating correlated slices as independent
+    generates artificially small p-values.
+    """
     if 'unit' in wilcox_df.columns:
-        wilcox_df = wilcox_df[wilcox_df['unit'] == 'slice']
+        wilcox_df = wilcox_df[wilcox_df['unit'] == unit]
     d = wilcox_df[wilcox_df['metric'] == metric]
     if d.empty:
         return None
+    dupes = int(d.duplicated(subset=['dataset', 'method_a', 'method_b']).sum())
+    if dupes:
+        raise ValueError(f'fig_pvalue_heatmap: {dupes} duplicate pairs after '
+                         f'filtering metric={metric} unit={unit}; a cell would '
+                         f'be silently overwritten')
     from matplotlib.colors import LinearSegmentedColormap
     cmap = LinearSegmentedColormap.from_list('seq_blue', SEQ_RAMP)
 
     names = order_datasets(d['dataset'].unique())
-    fig, axes = plt.subplots(1, len(names), figsize=(5.2 * len(names), 4.6), squeeze=False)
+    fig, axes = plt.subplots(1, len(names), figsize=(4.8 * len(names), 4.5), squeeze=False)
     im = None
     for ax, ds in zip(axes[0], names):
         sub     = d[d['dataset'] == ds]
@@ -970,21 +897,26 @@ def fig_pvalue_heatmap(wilcox_df, path, metric='dice'):
             mat[i, j] = mat[j, i] = r['p_holm']
         # encode magnitude as -log10(p) so stronger evidence reads as darker
         shown = np.where(np.isnan(mat), np.nan, -np.log10(np.clip(mat, 1e-12, 1.0)))
-        im = ax.imshow(shown, cmap=cmap, vmin=0, vmax=6)
+        vmax = 6 if unit == 'slice' else 3
+        im = ax.imshow(shown, cmap=cmap, vmin=0, vmax=vmax)
         for i in range(n):
             for j in range(n):
                 if i == j:
                     ax.text(j, i, '--', ha='center', va='center', fontsize=9, color=INK_MUTED)
                 elif np.isfinite(mat[i, j]):
-                    dark = shown[i, j] > 3
-                    ax.text(j, i, f'{mat[i, j]:.1e}\n{stars(mat[i, j])}', ha='center', va='center',
+                    dark = shown[i, j] > vmax * 0.55
+                    txt  = (f'{mat[i, j]:.1e}' if unit == 'slice'
+                            else f'{mat[i, j]:.3f}')
+                    ax.text(j, i, f'{txt}\n{stars(mat[i, j])}', ha='center', va='center',
                             fontsize=7.5, color=SURFACE if dark else INK)
         ax.set_xticks(range(n)); ax.set_xticklabels(methods, fontsize=8)
         ax.set_yticks(range(n)); ax.set_yticklabels(methods, fontsize=8)
-        ax.set_title(ds, fontsize=10)
+        n_unit = int(sub['n'].iloc[0]) if 'n' in sub.columns else None
+        ax.set_title(f'{ds}  (n = {n_unit} {unit}s)' if n_unit else ds,
+                     fontsize=10, fontweight='bold')
         ax.grid(visible=False)
-    fig.suptitle(f'Wilcoxon signed-rank on per-slice {metric}, Holm-adjusted  '
-                 '(*** p<0.001, ** p<0.01, * p<0.05, ns not significant)', fontsize=10)
+    fig.suptitle(f'Wilcoxon signed-rank on {unit}-level {metric}, Holm-adjusted\n'
+                 '*** p<0.001,  ** p<0.01,  * p<0.05,  ns not significant', fontsize=10)
     fig.tight_layout()
     if im is not None:
         # one shared scale, so the two panels are directly comparable
@@ -1003,7 +935,7 @@ def _fmt_p(p):
     return '<1e-300' if p < 1e-300 else f'{p:.3e}'
 
 
-def write_report(path, bundle, tables, extra_notes=None):
+def write_report(path, bundle, tables):
     """single human-readable txt covering every number the figures show."""
     L = []
     def head(title):
@@ -1083,36 +1015,9 @@ def write_report(path, bundle, tables, extra_notes=None):
                          f"[{r['q1']:>7.4f},{r['q3']:>7.4f}] "
                          f"[{r['ci_lo']:>10.4f}, {r['ci_hi']:>10.4f}]")
 
-    fr = tables.get('friedman')
-    if fr is not None and not fr.empty:
-        head("4. OMNIBUS TESTS ACROSS METHODS -- Friedman (continuous), Cochran Q (binary)")
-        L.append('  H0: all methods have the same distribution on this metric.')
-        L.append('  n is the number of paired blocks: slices for unit=slice, patients for')
-        L.append('   unit=patient. the chi2 approximation is unreliable below ~10 blocks.')
-        L.append('')
-        L.append(f"{'unit':<8} {'dataset':<12} {'metric':<10} {'k':>3} {'n':>7} {'chi2':>10} "
-                 f"{'df':>4} {'p':>11} {'p Holm':>11}  sig")
-        for _, r in fr.iterrows():
-            L.append(f"{r['unit']:<8} {r['dataset']:<12} {r['metric']:<10} {r['n_methods']:>3} "
-                     f"{r['n_slices']:>7} {r['chi2']:>10.2f} {r['df']:>4} "
-                     f"{_fmt_p(r['p_raw']):>11} {_fmt_p(r['p_holm']):>11}  {stars(r['p_holm'])}")
-
-    cq = tables.get('cochran_q')
-    if cq is not None and not cq.empty:
-        L.append('')
-        L.append("  Cochran's Q on the binary pointing game, the omnibus the pairwise")
-        L.append('  McNemar tests in section 6 sit under:')
-        L.append('')
-        L.append(f"{'unit':<8} {'dataset':<12} {'k':>3} {'n':>7} {'Q':>10} {'df':>4} "
-                 f"{'p':>11} {'p Holm':>11}  sig    hits per method")
-        for _, r in cq.iterrows():
-            L.append(f"{r['unit']:<8} {r['dataset']:<12} {r['n_methods']:>3} {r['n_slices']:>7} "
-                     f"{r['Q']:>10.2f} {r['df']:>4} {_fmt_p(r['p_raw']):>11} "
-                     f"{_fmt_p(r['p_holm']):>11}  {stars(r['p_holm']):<5} {r['hits']}")
-
     wx = tables.get('wilcoxon')
     if wx is not None and not wx.empty:
-        head('5. POST-HOC PAIRWISE -- Wilcoxon signed-rank, Holm-adjusted')
+        head('4. POST-HOC PAIRWISE -- Wilcoxon signed-rank, Holm-adjusted')
         L.append('  effect size: matched-pairs rank-biserial correlation, positive favours A.')
         for (unit, ds, metric), sub in wx.groupby(['unit', 'dataset', 'metric'], sort=False):
             L.append('')
@@ -1128,11 +1033,11 @@ def write_report(path, bundle, tables, extra_notes=None):
 
     mc = tables.get('mcnemar')
     if mc is not None and not mc.empty:
-        head('6. POINTING GAME -- exact McNemar on paired binary hits')
+        head('5. POINTING GAME -- exact McNemar on paired binary hits')
         L.append('  a_only = slices A hit and B missed; b_only = the reverse.')
         L.append('  slice level only. averaged over a patient the hit becomes a rate rather')
         L.append('  than a binary, so the patient-level pointing game is a unit=patient row')
-        L.append('  of the Wilcoxon table in section 5, not a McNemar row here.')
+        L.append('  of the Wilcoxon table in section 4, not a McNemar row here.')
         L.append('')
         L.append(f"{'dataset':<12} {'A':<8} {'B':<8} {'hits A':>7} {'hits B':>7} "
                  f"{'a_only':>7} {'b_only':>7} {'p':>11} {'p Holm':>11}  sig")
@@ -1141,37 +1046,15 @@ def write_report(path, bundle, tables, extra_notes=None):
                      f"{r['hits_a']:>7} {r['hits_b']:>7} {r['a_only']:>7} {r['b_only']:>7} "
                      f"{_fmt_p(r['p_raw']):>11} {_fmt_p(r['p_holm']):>11}  {stars(r['p_holm'])}")
 
-    cd = tables.get('cross_dataset')
-    if cd is not None and not cd.empty:
-        head('7. CROSS-DATASET GENERALISATION -- Mann-Whitney U, independent samples')
-        L.append("  H0: the same method performs equally on both datasets.")
-        L.append("  effect size: Cliff's delta, positive means dataset A scores higher.")
-        L.append('')
-        L.append(f"{'unit':<8} {'A':<11} {'B':<11} {'method':<8} {'metric':<10} {'mean A':>8} {'mean B':>8} "
-                 f"{'diff':>9} {'U':>12} {'p':>11} {'p Holm':>11} {'delta':>7}  size / sig")
-        for _, r in cd.iterrows():
-            L.append(f"{r['unit']:<8} {r['dataset_a']:<11} {r['dataset_b']:<11} {r['method']:<8} {r['metric']:<10} "
-                     f"{r['mean_a']:>8.4f} {r['mean_b']:>8.4f} {r['diff']:>+9.4f} {r['U']:>12.1f} "
-                     f"{_fmt_p(r['p_raw']):>11} {_fmt_p(r['p_holm']):>11} "
-                     f"{r['effect_cliffs_delta']:>+7.3f}  "
-                     f"{interpret_delta(r['effect_cliffs_delta'])} / {stars(r['p_holm'])}")
-
-    head('8. HOW TO READ THIS')
-    L.append('  - a Holm-adjusted p below 0.05 is the only result to call significant;')
-    L.append('    the raw p is printed for transparency, not for interpretation.')
-    L.append('  - with tens of thousands of slices, tiny AUC gaps reach significance.')
-    L.append('    always read the effect size and the CI width, not only the p-value.')
-    L.append('  - Dice on a GradCAM map is a localisation proxy, not segmentation accuracy:')
-    L.append('    a CAM is coarse and low-resolution by construction, so a low Dice against')
-    L.append('    a supervised U-Net is expected. Pointing game is the fairer XAI metric.')
-    L.append('  - the Chance rows are not a model. they are a uniform random saliency map at')
-    L.append('    the same threshold, so every method should be read against that row rather')
-    L.append('    than against zero. a pointing game of 0.00 on a dataset where chance is')
-    L.append('    0.004 over 40 slices is not below chance, it is simply underpowered.')
-    if extra_notes:
-        L.append('')
-        for note in extra_notes:
-            L.append(f'  - {note}')
+    ch = tables.get('chance')
+    if ch is not None and not ch.empty:
+        head('6. POINTING GAME UNDER CHANCE')
+        L.append(f"{'dataset':<12} {'pos slices':>10} {'analytic':>10} "
+                 f"{'monte carlo':>12} {'expected hits':>14}")
+        for _, r in ch.iterrows():
+            L.append(f"{r['dataset']:<12} {int(r['n_pos_slices']):>10} "
+                     f"{r['pg_chance_analytic']:>10.4f} {r['pg_chance_empirical']:>12.4f} "
+                     f"{r['expected_hits']:>14.2f}")
 
     L.append('')
     with open(str(path), 'w') as f:
@@ -1183,7 +1066,7 @@ def write_report(path, bundle, tables, extra_notes=None):
 # top-level driver, used by step 7
 # ---------------------------------------------------------------------------
 def run_all_analysis(bundle, output_dir, ts, prefix='all', n_boot=2000, seed=0,
-                     extra_notes=None, verbose=True):
+                     verbose=True):
     """
     run every test, write every csv, txt and figure.
     returns a dict of tables and a list of written paths.
@@ -1203,32 +1086,25 @@ def run_all_analysis(bundle, output_dir, ts, prefix='all', n_boot=2000, seed=0,
     say('  pairwise DeLong tests done')
     tables['seg_desc']      = seg_descriptive_table(bundle, n_boot=n_boot, seed=seed)
     say(f'  descriptive stats + {n_boot}x patient bootstrap done')
-    # each table runs twice, per slice as before and then per patient. holm runs
-    # inside each call, so the two units are separate families and every existing
-    # slice-level p_holm is unchanged.
-    tables['friedman']      = slice_and_patient(bundle, friedman_table,
-                                                patient_kw={'skip': ()})
+    # runs twice, per slice and then per patient. holm runs inside each call, so
+    # the two units are separate families and the slice-level p_holm is unchanged.
     tables['wilcoxon']      = slice_and_patient(bundle, wilcoxon_table,
                                                 patient_kw={'skip': ()})
-    tables['cross_dataset'] = slice_and_patient(bundle, cross_dataset_table,
-                                                patient_kw={'skip': ()})
-    # the pointing game is binary per slice, so mcnemar and cochran q stay slice
-    # level; averaged over a patient it is a rate and is covered by the unit=patient
-    # rows of the friedman and wilcoxon tables above
+    # the pointing game is binary per slice, so mcnemar stays slice level.
+    # averaged over a patient it becomes a rate, which the unit=patient rows of
+    # the wilcoxon table above already cover.
     tables['mcnemar']       = mcnemar_table(bundle)
-    tables['cochran_q']     = cochran_q_table(bundle)
-    say('  Friedman / Wilcoxon / McNemar / Cochran Q / Mann-Whitney done, slice and patient')
+    tables['chance']        = chance_reference_table(bundle)
+    say('  Wilcoxon and McNemar done, slice and patient')
 
     written = []
     csv_map = {
         'auc':           f'{prefix}_auc_results_{ts}.csv',
         'delong':        f'{prefix}_stats_delong_{ts}.csv',
         'seg_desc':      f'{prefix}_seg_descriptive_{ts}.csv',
-        'friedman':      f'{prefix}_stats_friedman_{ts}.csv',
         'wilcoxon':      f'{prefix}_stats_wilcoxon_{ts}.csv',
         'mcnemar':       f'{prefix}_stats_mcnemar_{ts}.csv',
-        'cochran_q':     f'{prefix}_stats_cochran_q_{ts}.csv',
-        'cross_dataset': f'{prefix}_stats_cross_dataset_{ts}.csv',
+        'chance':        f'{prefix}_stats_chance_{ts}.csv',
     }
     for key, fname in csv_map.items():
         df = tables.get(key)
@@ -1239,7 +1115,7 @@ def run_all_analysis(bundle, output_dir, ts, prefix='all', n_boot=2000, seed=0,
             say(f'  saved {p.name}')
 
     report = write_report(output_dir / f'{prefix}_stats_report_{ts}.txt',
-                          bundle, tables, extra_notes=extra_notes)
+                          bundle, tables)
     written.append(report)
     say(f'  saved {report.name}')
 
@@ -1272,7 +1148,8 @@ def run_all_analysis(bundle, output_dir, ts, prefix='all', n_boot=2000, seed=0,
             written.append(p); say(f'  saved {p.name}')
 
     p = fig_pvalue_heatmap(tables['wilcoxon'],
-                           output_dir / f'{prefix}_pvalues_dice_{ts}.png', metric='dice')
+                           output_dir / f'{prefix}_pvalues_dice_patient_{ts}.png',
+                           metric='dice', unit='patient')
     if p:
         written.append(p); say(f'  saved {p.name}')
 

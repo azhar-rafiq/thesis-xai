@@ -20,7 +20,6 @@ Inferential statistics (stats_utils.py):
   clustered bootstrap for every Dice/IoU confidence interval.
 
 Run via sbatch: sbatch 7_compare_all.sh
-Statistics without a GPU: the Inferential statistics section of thesis.ipynb
 """
 
 import csv
@@ -74,7 +73,22 @@ IMG_SIZE    = 256
 BATCH_SIZE  = 16
 THRESHOLD   = 0.5
 N_CLASSES   = 5
-N_QUAL_IMGS = 5
+N_QUAL_IMGS = 2
+N_QUAL_RSNA = 3
+
+# figure width
+FIG_W       = 6.7
+FIG_W_WIDE  = 9.6
+FIG_DPI     = 300
+TITLE_FS    = 7
+SUPTITLE_FS = 9
+
+
+def grid_figsize(n_cols, n_rows, width_in=FIG_W_WIDE,
+                 title_in=0.42, sup_in=0.35):
+    """square panels that fill width_in exactly, plus room for titles."""
+    panel = width_in / n_cols
+    return (width_in, n_rows * (panel + title_in) + sup_in)
 
 # pure forward passes can use a larger batch than the gradient-tape GradCAM loop
 INFER_BATCH = 64
@@ -91,6 +105,12 @@ CHANCE_SEED  = SEED + 1
 CHANCE_DRAWS = 1000
 
 RSNA_LABEL_COLS = ['epidural', 'intraparenchymal', 'intraventricular', 'subarachnoid', 'subdural']
+# the first three characters collide (intra..., sub...), so use the clinical codes
+RSNA_LABEL_SHORT = {'epidural':         'EDH',
+                    'intraparenchymal': 'IPH',
+                    'intraventricular': 'IVH',
+                    'subarachnoid':     'SAH',
+                    'subdural':         'SDH'}
 
 # ---- load RSNA test sample (qualitative only -- no pixel masks) ----
 CACHE_DIR = Path(os.getenv('KAGGLE_CACHE')) / 'preprocessed'
@@ -106,16 +126,16 @@ print(f"RSNA cache: {_meta_path.name}", flush=True)
 rsna_x_mm = np.load(f'{_base}_x_test.npy', mmap_mode='r')
 rsna_y_mm = np.load(f'{_base}_y_test.npy', mmap_mode='r')
 
-# pick N_QUAL_IMGS ICH-positive slices spread across the test set
+# pick N_QUAL_RSNA ICH-positive slices spread across the test set
 _pos_mask   = rsna_y_mm.sum(axis=1) > 0
 _pos_indices = np.where(_pos_mask)[0]
 np.random.seed(SEED)
 _chosen = np.random.choice(_pos_indices,
-                            size=min(N_QUAL_IMGS, len(_pos_indices)),
+                            size=min(N_QUAL_RSNA, len(_pos_indices)),
                             replace=False)
 _chosen.sort()
-rsna_sample_x = rsna_x_mm[_chosen].copy().astype(np.float32)  # (N_QUAL_IMGS, H, W, 3)
-rsna_sample_y = rsna_y_mm[_chosen].copy().astype(np.float32)  # (N_QUAL_IMGS, 5)
+rsna_sample_x = rsna_x_mm[_chosen].copy().astype(np.float32)  # (N_QUAL_RSNA, H, W, 3)
+rsna_sample_y = rsna_y_mm[_chosen].copy().astype(np.float32)  # (N_QUAL_RSNA, 5)
 print(f"  RSNA sample: {len(_chosen)} ICH-positive slices (indices {_chosen.tolist()})", flush=True)
 
 # slice range used for the classification AUC arm
@@ -124,8 +144,8 @@ rsna_y_eval = np.asarray(rsna_y_mm[:N_RSNA_EVAL], dtype=np.float32)
 print(f"  RSNA classification arm: {N_RSNA_EVAL:,} slices "
       f"({'full test set' if N_RSNA_AUC is None else 'capped by N_RSNA_AUC'})", flush=True)
 
-rsna_cam_maps   = {}   # method -> (N_QUAL_IMGS, H, W, 1) float32
-rsna_preds      = {}   # method -> (N_QUAL_IMGS, 5) float32
+rsna_cam_maps   = {}   # method -> (N_QUAL_RSNA, H, W, 1) float32
+rsna_preds      = {}   # method -> (N_QUAL_RSNA, 5) float32
 
 # classification probabilities collected for the AUC / ROC / statistics arm
 rsna_probs  = {}   # model -> (N_RSNA_EVAL, 5) float32
@@ -647,9 +667,9 @@ else:
                     ('recall', 'Recall'), ('precision', 'Precision'),
                     ('pointing_game', 'Pointing Game'), ('ap', 'Avg Precision')]
 
-    for ds_name, y_test, pos_idx, slice_df in [
-            ('PhysioNet', y_phys,  phys_pos_idx,  phys_df),
-            ('CQ500',     y_cq500, cq500_pos_idx, cq500_df)]:
+    for ds_name, x_test, y_test, pos_idx, slice_df in [
+            ('PhysioNet', x_phys,  y_phys,  phys_pos_idx,  phys_df),
+            ('CQ500',     x_cq500, y_cq500, cq500_pos_idx, cq500_df)]:
 
         if ds_name not in [r[0] for r in results_df.index]:
             continue
@@ -660,26 +680,43 @@ else:
                       for m in methods}
 
         # bar chart
-        fig, axes = plt.subplots(2, 3, figsize=(16, 8))
+        fig, axes = plt.subplots(2, 3,
+                                 figsize=(FIG_W_WIDE, FIG_W_WIDE * 0.52))
+        
+        clusters = slice_df.loc[pos_idx, 'patient'].astype(str).values
         for ax, (metric, label) in zip(axes.ravel(), metric_specs):
-            col     = metric if metric == 'pointing_game' else f'{metric}_mean'
-            std_col = f'{metric}_std' if f'{metric}_std' in ds_results.columns else None
-            means   = ds_results[col].values
-            stds    = ds_results[std_col].values if std_col else None
-            title   = label if metric == 'pointing_game' else f'{label}  (mean +/- std)'
-            bars    = ax.barh(methods, means, xerr=stds, capsize=4, color='steelblue', height=0.5)
-            ax.set_xlim(0, 1.05)
+            key   = 'pg' if metric == 'pointing_game' else metric
+            means, lo_arm, hi_arm = [], [], []
+            for m in methods:
+                v  = np.asarray(per_slice[ds_name][m][key], dtype=float)
+                mu = float(v.mean())
+                lo, hi = su.cluster_bootstrap_ci(v, clusters,
+                                                 n_boot=N_BOOTSTRAP, seed=SEED)
+                means.append(mu)
+                lo_arm.append(max(mu - lo, 0.0))
+                hi_arm.append(max(hi - mu, 0.0))
+            means  = np.asarray(means)
+            lo_arm = np.asarray(lo_arm)
+            hi_arm = np.asarray(hi_arm)
+            bars   = ax.barh(methods, means, xerr=np.vstack([lo_arm, hi_arm]),
+                             capsize=2.5, color='steelblue', height=0.5,
+                             error_kw={'elinewidth': 0.9})
+            # the value sits past the end of the whisker, and the axis is widened
+            # to leave room for it, otherwise the text lands on the error bar
+            reach = max(float(np.nanmax(means + hi_arm)), 0.05)
+            ax.set_xlim(0, reach * 1.30)
+            pad = reach * 0.035
             ax.set_xlabel(label)
-            ax.set_title(title)
+            ax.set_title(f'{label}  (mean, 95% CI)')
             ax.invert_yaxis()
-            for bar, v in zip(bars, means):
-                ax.text(v + 0.01, bar.get_y() + bar.get_height() / 2,
-                        f'{v:.3f}', va='center', fontsize=9)
+            for bar, v, e in zip(bars, means, hi_arm):
+                ax.text(v + e + pad, bar.get_y() + bar.get_height() / 2,
+                        f'{v:.3f}', va='center', fontsize=TITLE_FS)
         plt.suptitle(f'{ds_name}  (n={len(pos_idx)} ICH-positive slices, threshold={THRESHOLD})',
-                     fontsize=11)
+                     fontsize=SUPTITLE_FS)
         plt.tight_layout()
         bar_path = OUTPUT_DIR / f'all_comparison_bar_{ds_name.lower()}_{ts}.png'
-        plt.savefig(str(bar_path), dpi=120, bbox_inches='tight')
+        plt.savefig(str(bar_path), dpi=FIG_DPI, bbox_inches='tight')
         plt.close()
         print(f"Saved bar chart: {bar_path.name}", flush=True)
 
@@ -693,62 +730,52 @@ else:
             best = max(idxs, key=lambda i: float(y_test[i, :, :, 0].sum()))
             sample_idx.append(best)
 
-        if sample_idx:
-            n_cols = 2 + n_m
-            fig, axes = plt.subplots(N_QUAL_IMGS, n_cols,
-                                     figsize=(3.5 * n_cols, 3.5 * N_QUAL_IMGS),
+        # one figure per sample: 6 panels in a 3x2 grid, portrait width, so each
+        # brain is large enough to read on the page
+        for sl in sample_idx:
+            p_id   = slice_df.loc[sl, 'patient']
+            s_id   = slice_df.loc[sl, 'slice']
+            gt_bin = y_test[sl, :, :, 0] > 0.5
+            tag    = f'p{p_id}_s{s_id}'
+
+            # soft maps: CT with the mask outlined, then one panel per method
+            fig, axes = plt.subplots(2, 3, figsize=grid_figsize(3, 2, width_in=FIG_W),
                                      squeeze=False)
-            for row_i, sl in enumerate(sample_idx):
-                p_id = slice_df.loc[sl, 'patient']
-                s_id = slice_df.loc[sl, 'slice']
-
-                axes[row_i, 0].imshow(y_test[sl, :, :, 0], cmap='hot', vmin=0, vmax=1)
-                axes[row_i, 0].set_title('GT mask', fontsize=8)
-                axes[row_i, 0].axis('off')
-
-                axes[row_i, 1].imshow(y_test[sl, :, :, 0], cmap='hot', vmin=0, vmax=1)
-                axes[row_i, 1].set_title(f'CT  p{p_id} s{s_id}', fontsize=8)
-                axes[row_i, 1].axis('off')
-
-                for col_i, method in enumerate(methods):
-                    d, iou, *_ = seg_metrics(y_test[sl], bin_maps[method][sl])
-                    axes[row_i, 2 + col_i].imshow(
-                        cam_maps[ds_name][method][sl, :, :, 0].astype(np.float32),
-                        cmap='hot', vmin=0, vmax=1)
-                    axes[row_i, 2 + col_i].set_title(
-                        f'{method}\nDice {d:.3f}  IoU {iou:.3f}', fontsize=8)
-                    axes[row_i, 2 + col_i].axis('off')
-
-            plt.suptitle(f'{ds_name} -- soft maps', fontsize=11, y=1.01)
+            flat = axes.ravel()
+            flat[0].imshow(x_test[sl, :, :, 0], cmap='gray')
+            flat[0].contour(gt_bin, levels=[0.5], colors='cyan', linewidths=0.9)
+            flat[0].set_title('CT  (cyan = radiologist mask)', fontsize=TITLE_FS)
+            for ax_i, method in enumerate(methods, start=1):
+                d, iou, *_ = seg_metrics(y_test[sl], bin_maps[method][sl])
+                flat[ax_i].imshow(cam_maps[ds_name][method][sl, :, :, 0].astype(np.float32),
+                                  cmap='hot', vmin=0, vmax=1)
+                flat[ax_i].set_title(f'{method}\nDice {d:.3f}  IoU {iou:.3f}',
+                                     fontsize=TITLE_FS)
+            for ax in flat:
+                ax.axis('off')
+            plt.suptitle(f'{ds_name} {tag} -- unthresholded saliency maps',
+                         fontsize=SUPTITLE_FS, y=1.00)
             plt.tight_layout()
-            soft_path = OUTPUT_DIR / f'all_comparison_soft_{ds_name.lower()}_{ts}.png'
-            plt.savefig(str(soft_path), dpi=120, bbox_inches='tight')
+            soft_path = OUTPUT_DIR / f'all_comparison_soft_{ds_name.lower()}_{tag}_{ts}.png'
+            plt.savefig(str(soft_path), dpi=FIG_DPI, bbox_inches='tight')
             plt.close()
             print(f"Saved soft-map figure: {soft_path.name}", flush=True)
 
-            # error maps
-            fig, axes = plt.subplots(N_QUAL_IMGS, 1 + n_m,
-                                     figsize=(3.5 * (1 + n_m), 3.5 * N_QUAL_IMGS),
+            # error maps: same grid, same first panel
+            fig, axes = plt.subplots(2, 3, figsize=grid_figsize(3, 2, width_in=FIG_W,
+                                                                title_in=0.5),
                                      squeeze=False)
-            for row_i, sl in enumerate(sample_idx):
-                p_id   = slice_df.loc[sl, 'patient']
-                s_id   = slice_df.loc[sl, 'slice']
-                gt_bin = y_test[sl, :, :, 0] > 0.5
-
-                axes[row_i, 0].imshow(y_test[sl, :, :, 0], cmap='gray')
-                axes[row_i, 0].contour(gt_bin, levels=[0.5], colors='cyan', linewidths=1.0)
-                axes[row_i, 0].set_title(f'CT  p{p_id} s{s_id}\n(cyan=GT)', fontsize=8)
-                axes[row_i, 0].axis('off')
-
-                for col_i, method in enumerate(methods):
-                    d, iou, rec, prec = seg_metrics(y_test[sl], bin_maps[method][sl])
-                    err = error_rgb(y_test[sl], bin_maps[method][sl])
-                    axes[row_i, 1 + col_i].imshow(err)
-                    axes[row_i, 1 + col_i].set_title(
-                        f'{method}\nDice {d:.3f}  IoU {iou:.3f}\n'
-                        f'Rec {rec:.3f}  Prec {prec:.3f}', fontsize=8)
-                    axes[row_i, 1 + col_i].axis('off')
-
+            flat = axes.ravel()
+            flat[0].imshow(x_test[sl, :, :, 0], cmap='gray')
+            flat[0].contour(gt_bin, levels=[0.5], colors='cyan', linewidths=0.9)
+            flat[0].set_title('CT  (cyan = radiologist mask)', fontsize=TITLE_FS)
+            for ax_i, method in enumerate(methods, start=1):
+                d, iou, rec, prec = seg_metrics(y_test[sl], bin_maps[method][sl])
+                flat[ax_i].imshow(error_rgb(y_test[sl], bin_maps[method][sl]))
+                flat[ax_i].set_title(f'{method}\nDice {d:.3f}  Rec {rec:.3f}',
+                                     fontsize=TITLE_FS)
+            for ax in flat:
+                ax.axis('off')
             legend_patches = [
                 mpatches.Patch(color=(0/255, 180/255, 0/255),  label='TP'),
                 mpatches.Patch(color=(200/255, 0/255, 0/255),  label='FP'),
@@ -756,41 +783,54 @@ else:
                 mpatches.Patch(color=(30/255, 30/255, 30/255), label='TN'),
             ]
             fig.legend(handles=legend_patches, loc='lower center', ncol=4,
-                       fontsize=10, frameon=True, bbox_to_anchor=(0.5, -0.02))
-            plt.suptitle(f'{ds_name} -- error maps  (TP=green  FP=red  FN=blue  TN=dark)',
-                         fontsize=11, y=1.01)
+                       fontsize=TITLE_FS, frameon=True, bbox_to_anchor=(0.5, -0.03))
+            plt.suptitle(f'{ds_name} {tag} -- error maps', fontsize=SUPTITLE_FS, y=1.00)
             plt.tight_layout()
-            err_path = OUTPUT_DIR / f'all_comparison_error_{ds_name.lower()}_{ts}.png'
-            plt.savefig(str(err_path), dpi=120, bbox_inches='tight')
+            err_path = OUTPUT_DIR / f'all_comparison_error_{ds_name.lower()}_{tag}_{ts}.png'
+            plt.savefig(str(err_path), dpi=FIG_DPI, bbox_inches='tight')
             plt.close()
             print(f"Saved error-map figure: {err_path.name}", flush=True)
 
     # ---- combined Dice bar chart (both datasets side-by-side) ----
-    fig, ax = plt.subplots(figsize=(10, 5))
+    fig, ax = plt.subplots(figsize=(FIG_W, FIG_W * 0.55))
     all_methods = list(dict.fromkeys(
         m for (_, m) in results_df.index))   # preserve insertion order, dedupe
     x      = np.arange(len(all_methods))
     width  = 0.35
     colors = {'PhysioNet': 'steelblue', 'CQ500': 'darkorange'}
 
+    top = 0.0
     for i, (ds_name, color) in enumerate(colors.items()):
         if ds_name not in results_df.index.get_level_values('dataset'):
             continue
-        ds_res = results_df.loc[ds_name]
-        means  = [ds_res.loc[m, 'dice_mean'] if m in ds_res.index else 0.0 for m in all_methods]
-        stds   = [ds_res.loc[m, 'dice_std']  if m in ds_res.index else 0.0 for m in all_methods]
-        ax.bar(x + i * width, means, width, yerr=stds, label=ds_name,
-               color=color, capsize=4, alpha=0.85)
+        clusters = (phys_df if ds_name == 'PhysioNet' else cq500_df).loc[
+            phys_pos_idx if ds_name == 'PhysioNet' else cq500_pos_idx,
+            'patient'].astype(str).values
+        means, lo_arm, hi_arm = [], [], []
+        for m in all_methods:
+            v = per_slice[ds_name].get(m, {}).get('dice')
+            if v is None:
+                means.append(0.0); lo_arm.append(0.0); hi_arm.append(0.0); continue
+            v  = np.asarray(v, dtype=float)
+            mu = float(v.mean())
+            lo, hi = su.cluster_bootstrap_ci(v, clusters, n_boot=N_BOOTSTRAP, seed=SEED)
+            means.append(mu)
+            lo_arm.append(max(mu - lo, 0.0))
+            hi_arm.append(max(hi - mu, 0.0))
+        ax.bar(x + i * width, means, width,
+               yerr=np.vstack([lo_arm, hi_arm]), label=ds_name,
+               color=color, capsize=3, alpha=0.85, error_kw={'elinewidth': 0.9})
+        top = max(top, max(np.asarray(means) + np.asarray(hi_arm)))
 
     ax.set_xticks(x + width / 2)
     ax.set_xticklabels(all_methods)
-    ax.set_ylim(0, 1.05)
-    ax.set_ylabel('Dice (mean +/- std)')
+    ax.set_ylim(0, max(top, 0.05) * 1.12)
+    ax.set_ylabel('Dice (mean, 95% CI)')
     ax.set_title(f'Dice -- PhysioNet vs Seg-CQ500  (threshold={THRESHOLD})')
     ax.legend()
     plt.tight_layout()
     combined_path = OUTPUT_DIR / f'all_comparison_dice_combined_{ts}.png'
-    plt.savefig(str(combined_path), dpi=120, bbox_inches='tight')
+    plt.savefig(str(combined_path), dpi=FIG_DPI, bbox_inches='tight')
     plt.close()
     print(f"Saved combined Dice chart: {combined_path.name}", flush=True)
 
@@ -802,35 +842,42 @@ if MATPLOTLIB and rsna_cam_maps:
     n_cols = 1 + len(methods_rsna)   # CT + one column per method
 
     fig, axes = plt.subplots(len(rsna_sample_x), n_cols,
-                             figsize=(3.5 * n_cols, 3.5 * len(rsna_sample_x)),
+                             figsize=grid_figsize(n_cols, len(rsna_sample_x),
+                                                  title_in=0.62),
                              squeeze=False)
 
     for row_i in range(len(rsna_sample_x)):
         true_labels = [RSNA_LABEL_COLS[j] for j in range(len(RSNA_LABEL_COLS))
                        if rsna_sample_y[row_i, j] > 0.5]
-        true_str = ', '.join(true_labels) if true_labels else 'none'
+        true_str = (', '.join(RSNA_LABEL_SHORT[t] for t in true_labels)
+                    if true_labels else 'none')
 
         axes[row_i, 0].imshow(rsna_sample_x[row_i, :, :, 0], cmap='gray')
-        axes[row_i, 0].set_title(f'RSNA slice {_chosen[row_i]}\nTrue: {true_str}', fontsize=7)
+        axes[row_i, 0].set_title(f'RSNA slice {_chosen[row_i]}\nTrue: {true_str}',
+                                 fontsize=TITLE_FS)
         axes[row_i, 0].axis('off')
 
         for col_i, method in enumerate(methods_rsna):
             cam = rsna_cam_maps[method][row_i, :, :, 0].astype(np.float32)
             axes[row_i, 1 + col_i].imshow(cam, cmap='hot', vmin=0, vmax=1)
             if method in rsna_preds:
-                pred_str = '  '.join(
-                    f'{RSNA_LABEL_COLS[j][:3]}={rsna_preds[method][row_i, j]:.2f}'
-                    for j in range(len(RSNA_LABEL_COLS)))
-                axes[row_i, 1 + col_i].set_title(f'{method}\n{pred_str}', fontsize=6)
+                parts = [f'{RSNA_LABEL_SHORT[c]} {rsna_preds[method][row_i, j]:.2f}'
+                         for j, c in enumerate(RSNA_LABEL_COLS)]
+                # three per line, otherwise the string runs into the next panel
+                pred_str = '\n'.join('  '.join(parts[i:i + 3])
+                                     for i in range(0, len(parts), 3))
+                axes[row_i, 1 + col_i].set_title(f'{method}\n{pred_str}', fontsize=TITLE_FS)
             else:
-                axes[row_i, 1 + col_i].set_title(method, fontsize=8)
+                axes[row_i, 1 + col_i].set_title(method, fontsize=TITLE_FS)
             axes[row_i, 1 + col_i].axis('off')
 
-    plt.suptitle('RSNA test set -- GradCAM activations (no pixel-mask GT)',
-                 fontsize=11, y=1.01)
+    plt.suptitle('RSNA test set -- GradCAM activations (no pixel-mask GT)\n'
+                 'EDH epidural, IPH intraparenchymal, IVH intraventricular, '
+                 'SAH subarachnoid, SDH subdural',
+                 fontsize=SUPTITLE_FS, y=1.00)
     plt.tight_layout()
     rsna_fig_path = OUTPUT_DIR / f'all_comparison_rsna_gradcam_{ts}.png'
-    plt.savefig(str(rsna_fig_path), dpi=120, bbox_inches='tight')
+    plt.savefig(str(rsna_fig_path), dpi=FIG_DPI, bbox_inches='tight')
     plt.close()
     print(f"Saved RSNA qualitative figure: {rsna_fig_path.name}", flush=True)
 
@@ -876,8 +923,8 @@ else:
     print("  no RSNA classification probabilities -- classification arm limited to "
           "the external datasets.", flush=True)
 
-# noisy-OR is reported as a sensitivity check only, max stays the headline score
-noisy_or_notes = []
+# noisy-OR is a sensitivity check only, max stays the headline score
+noisy_or_rows = []
 
 for ds_name, df_slices, probs, unet_maps in [
         ('PhysioNet', phys_df,  phys_probs,  phys_unet_preds),
@@ -897,9 +944,8 @@ for ds_name, df_slices, probs, unet_maps in [
         if y_any.sum() and y_any.sum() < len(y_any):
             auc_max = su.delong_auc_ci(y_any, s_max)[0]
             auc_nor = su.delong_auc_ci(y_any, s_nor)[0]
-            noisy_or_notes.append(
-                f'{ds_name} {model} any-ICH AUC: {auc_max:.4f} with max-over-subtypes '
-                f'vs {auc_nor:.4f} with noisy-OR (headline figures use max)')
+            noisy_or_rows.append({'dataset': ds_name, 'model': model,
+                                  'auc_max': auc_max, 'auc_noisy_or': auc_nor})
     scores['U-Net'] = unet_slice_score(unet_maps)
 
     bundle['external'][ds_name] = {
@@ -912,35 +958,27 @@ for ds_name, df_slices, probs, unet_maps in [
     print(f"  {ds_name}: {len(y_any)} slices, {int(y_any.sum())} ICH-positive, "
           f"classification models {list(scores)}", flush=True)
 
+# the bundle does not store lesion areas, so this is carried rather than recomputed
+for ds_name, y_test, pos_idx in [('PhysioNet', y_phys,  phys_pos_idx),
+                                 ('CQ500',     y_cq500, cq500_pos_idx)]:
+    if ds_name not in bundle['external']:
+        continue
+    analytic, empirical = chance_pointing_game(y_test, pos_idx)
+    bundle['external'][ds_name]['pg_chance'] = {'analytic': analytic,
+                                                'empirical': empirical}
+
 bundle_path = OUTPUT_DIR / f'all_raw_{ts}.npz'
 su.save_bundle(bundle_path, bundle)
 print(f"\nSaved raw bundle: {bundle_path.name}", flush=True)
 print(f"  re-run the statistics on CPU from thesis.ipynb using {bundle_path.name}", flush=True)
 
-chance_notes = []
-for ds_name, y_test, pos_idx in [('PhysioNet', y_phys,  phys_pos_idx),
-                                 ('CQ500',     y_cq500, cq500_pos_idx)]:
-    analytic, empirical = chance_pointing_game(y_test, pos_idx)
-    chance_notes.append(
-        f'{ds_name} pointing game under chance: {analytic:.4f} analytic (mean lesion area '
-        f'fraction over {len(pos_idx)} positive slices) vs {empirical:.4f} from '
-        f'{CHANCE_DRAWS} uniformly random peaks per slice, so chance expects '
-        f'{analytic * len(pos_idx):.2f} hits in total. a pointing game of 0.00 is only '
-        f'below chance if it is below this value.')
-chance_notes.append(
-    'the Chance rows are a uniform random saliency map thresholded at the same '
-    'cut-off, so their recall is trivially about 0.5 and their precision about the '
-    'lesion prevalence. read Chance against Dice, IoU, average precision and the '
-    'pointing game, not against recall.')
-
-notes = [
-    'the RSNA U-Net row is a classifier head on a frozen U-Net encoder, while the '
-    'PhysioNet and CQ500 U-Net rows are the supervised segmenters from steps 5 and 6.',
-] + chance_notes + noisy_or_notes
+if noisy_or_rows:
+    nor_path = OUTPUT_DIR / f'all_sensitivity_noisy_or_{ts}.csv'
+    pd.DataFrame(noisy_or_rows).to_csv(str(nor_path), index=False)
+    print(f"Saved noisy-OR sensitivity check: {nor_path.name}", flush=True)
 
 tables, written = su.run_all_analysis(bundle, OUTPUT_DIR, ts,
-                                      prefix='all', n_boot=N_BOOTSTRAP, seed=SEED,
-                                      extra_notes=notes)
+                                      prefix='all', n_boot=N_BOOTSTRAP, seed=SEED)
 
 # ---- console summary of the headline numbers ----
 auc_df = tables['auc']
