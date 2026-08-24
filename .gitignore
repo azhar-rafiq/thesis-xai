@@ -6,9 +6,9 @@ backup/
 *.out
 *.stats
 *.h5
-# *.png
+*.png
 *.pkl
-# *.csv 
+*.csv 
 *.npz
 *.log
 *.pyc

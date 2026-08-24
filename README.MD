@@ -12,7 +12,7 @@ Azhar | MSc Health Data Science, UoB
 | RQ2 | segment haemorrhage at pixel level | supervised U-Net on PhysioNet and Seg-CQ500 pixel masks | done: Dice 0.4009 (PhysioNet), 0.4372 (Seg-CQ500), all test slices |
 | RQ3 | do heatmaps actually point at the bleed? | GradCAM from RQ1 models vs pixel masks, against a random-map chance baseline | done |
 | RQ4 | how does XAI compare to supervised segmentation? | Dice / IoU / recall / precision / pointing game / AP, plus Holm-corrected significance tests | done: `7_compare_all.py` |
-| RQ5 | does any of it transfer off RSNA? | RSNA-trained classifiers scored zero-shot on PhysioNet and Seg-CQ500 as slice-level "any ICH" | done: best any-ICH AUC 0.8097 (PhysioNet) / 0.7905 (CQ500) |
+| RQ5 | how well trained models generalise to external dataset? | RSNA-trained classifiers scored zero-shot on PhysioNet and Seg-CQ500 as slice-level "any ICH" | done: best any-ICH AUC 0.8098 (PhysioNet) / 0.7906 (CQ500) |
 
 ---
 
@@ -69,10 +69,10 @@ Same 3-window preprocessing applied to the PhysioNet and Seg-CQ500 NIfTIs (loade
 6_train_cq500.py           supervised U-Net on Seg-CQ500 pixel masks            (RQ2)
 7_compare_all.py           cross-dataset comparison, writes the all_raw bundle   (RQ3/RQ4/RQ5)
 thesis.ipynb               inferential statistics from that bundle, CPU only    (RQ3/RQ4/RQ5)
-stats_utils.py             DeLong, Friedman, Wilcoxon, McNemar, bootstrap, figures
+stats_utils.py             DeLong, Wilcoxon, McNemar, chance reference, bootstrap, figures
 ```
 
-`6_compare_physionet.py` is the earlier PhysioNet-only version of step 7, kept for reference. Step 7 replace it: same metrics, all three datasets, plus the classification arm and the significance tests.
+`6_compare_physionet.py` is the earlier PhysioNet-only version of step 7, kept for reference. Step 7 replaces it: same metrics, all three datasets, plus the classification arm and the significance tests.
 
 **Model naming:** `rsna_{method}_{date}-{XX}_{cv_auc}_auc.keras` where `{XX}` is a random 2-letter tag to prevent collisions. e.g. `rsna_vit_20260608-ZU_08740_auc.keras`
 
@@ -149,6 +149,7 @@ Both segmenters are the same architecture on different pixel-mask datasets.
 
 - encoder initialised from the RSNA CNN checkpoint `rsna_cnn_20260722-BD_nan_auc.keras`, frozen, only the decoder learns
 - patient-level 80/20 train/test split at SEED=20260605: PhysioNet 60 train / 15 test, Seg-CQ500 40 train / 11 test
+- of the 15 PhysioNet test patients only **6** contribute ICH-positive slices, so the whole localisation arm rests on 6 patients there. All 11 Seg-CQ500 test patients are ICH-positive. 6 and 11 are the effective sample sizes behind every localisation interval and p-value below, not 15 and 11
 - loss: BCE + Dice (handles sparse positive pixels better than BCE alone)
 - augmentation: horizontal flip only (vertical flip disabled, it is not anatomically plausible for axial CT)
 - 50 epochs max, lr 1e-4, early stopping on `val_dice_positive_only`
@@ -165,13 +166,15 @@ It loads each classifier once and scores everything:
 
 Metrics per method: **Dice**, **IoU**, **pixel recall**, **pixel precision**, **average precision**, **Pointing Game** (Selvaraju et al. 2020, doi:10.1007/s11263-019-01228-7: whether the peak activation pixel falls inside the GT mask, threshold-free).
 
-**Chance baseline**: a uniform random saliency map at the same threshold, entered as just another method so it flows through every table and figure. Its pointing game expectation is the mean lesion area fraction, 0.0040 on PhysioNet and 0.0091 on CQ500. A pointing game of 0.00 is only below chance if it is below that value, which is the reason the row exists.
+**Chance baseline**: a uniform random saliency map at the same threshold, entered as just another method so it flows through every table and figure. Its pointing game expectation is the mean lesion area fraction, 0.0040 on PhysioNet and 0.0091 on CQ500, matched by a Monte Carlo estimate over 1000 random peaks per slice (0.0039 and 0.0092). Both go to `all_stats_chance_{ts}.csv` with the expected hit count, 0.16 on PhysioNet and 7.29 on CQ500. A pointing game of 0.00 is only below chance if it is below that value, which is the reason the row exists.
 
-**Classification arm** (all three datasets): ROC and AUC for CNN, ViT, Hybrid and U-Net. RSNA is the internal test set, PhysioNet and CQ500 are zero-shot external validation scored as slice-level "any ICH" (max over the five subtype probabilities, with noisy-OR reported as a sensitivity check).
+**Classification arm** (all three datasets): ROC and AUC for CNN, ViT, Hybrid and U-Net. RSNA is the internal test set, PhysioNet and CQ500 are zero-shot external validation scored as slice-level "any ICH" (max over the five subtype probabilities). Noisy-OR is run on the same scores as a sensitivity check and written to `all_sensitivity_noisy_or_{ts}.csv`.
 
-**Inferential statistics** (`stats_utils.py`): DeLong for paired AUCs, Friedman + Wilcoxon + Cochran Q + McNemar for localisation, Mann-Whitney across datasets, all Holm-corrected, plus a patient-clustered bootstrap for every Dice/IoU confidence interval. Slice-level tests are repeated with one value per patient, and the `unit=patient` rows are the conservative reading.
+**Inferential statistics** (`stats_utils.py`): DeLong for paired AUCs, Wilcoxon signed-rank for the continuous localisation metrics, exact McNemar for the binary pointing game, all Holm-corrected within their own family, plus a patient-clustered bootstrap for every Dice/IoU confidence interval. Wilcoxon runs twice, once per slice and once with each patient collapsed to a single value, and the `unit=patient` rows are the conservative reading.
 
-**RSNA qualitative panel**: 5 ICH-positive test slices with CT + CNN / ViT / Hybrid activation maps, titled with true and predicted labels. RSNA has no pixel masks, so it gets no Dice.
+No omnibus test precedes the pairwise ones: Holm-Bonferroni controls the family-wise rate inside each pairwise family directly. The tables written are `auc`, `delong`, `wilcoxon`, `mcnemar`, `chance` and `seg_descriptive`.
+
+**RSNA qualitative panel**: 3 ICH-positive test slices (`N_QUAL_RSNA`) with CT + CNN / ViT / Hybrid activation maps, titled with true and predicted labels under the subtype codes EDH / IPH / IVH / SAH / SDH. RSNA has no pixel masks, so it gets no Dice.
 
 This is not a direct comparison. As stated in the report's header, the CNN, ViT, and Hybrid models are evaluated in a zero-shot setting, whereas the U-Net results reflect supervised training on the target distributions.
 
@@ -179,27 +182,30 @@ This is not a direct comparison. As stated in the report's header, the CNN, ViT,
 
 ## step 7 outputs
 
-All 27 files land in `~/thesis-xai/result/`, prefixed `all_` and stamped with one timestamp per run.
+All 30 files land in `~/thesis-xai/result/`, prefixed `all_` and stamped with one timestamp per run.
 
-| file | content |
-|------|---------|
-| `all_comparison_results_{ts}.csv` | localisation metrics per dataset and method |
-| `all_comparison_bar_{dataset}_{ts}.png` | 6-metric bar chart per dataset |
-| `all_comparison_soft_{dataset}_{ts}.png` | soft maps, one representative slice per positive patient |
-| `all_comparison_error_{dataset}_{ts}.png` | TP/FP/FN/TN error maps |
-| `all_comparison_dice_combined_{ts}.png` | Dice, both datasets side by side |
-| `all_comparison_rsna_gradcam_{ts}.png` | RSNA qualitative panel |
-| `all_raw_{ts}.npz` | every per-slice probability and metric; the bundle the notebook analyses |
-| `all_auc_results_{ts}.csv` | AUC, DeLong CI and AP per dataset / target / model |
-| `all_seg_descriptive_{ts}.csv` | localisation means with patient-clustered bootstrap CIs |
-| `all_stats_{delong,friedman,wilcoxon,mcnemar,cochran_q,cross_dataset}_{ts}.csv` | one file per test family, Holm-adjusted |
-| `all_stats_report_{ts}.txt` | the whole analysis as a readable report, including how to read it |
-| `all_{roc_rsna,auc_rsna_dots,auc_forest,roc_external,pr_external,dist_dice,dist_iou,pvalues_dice}_{ts}.png` | statistics figures |
+| file | count | content |
+|------|------:|---------|
+| `all_comparison_results_{ts}.csv` | 1 | localisation metrics per dataset and method |
+| `all_comparison_bar_{dataset}_{ts}.png` | 2 | 6-metric bar chart per dataset, mean with a 95% patient-clustered bootstrap CI |
+| `all_comparison_soft_{dataset}_p{patient}_s{slice}_{ts}.png` | 4 | unthresholded saliency, one file per sample slice: CT with the mask outlined in cyan, then one panel per method |
+| `all_comparison_error_{dataset}_p{patient}_s{slice}_{ts}.png` | 4 | TP/FP/FN/TN error maps, same slices and same layout |
+| `all_comparison_dice_combined_{ts}.png` | 1 | Dice, both datasets side by side |
+| `all_comparison_rsna_gradcam_{ts}.png` | 1 | RSNA qualitative panel |
+| `all_raw_{ts}.npz` | 1 | every per-slice probability and metric; the bundle the notebook analyses |
+| `all_auc_results_{ts}.csv` | 1 | AUC, DeLong CI and AP per dataset / target / model |
+| `all_seg_descriptive_{ts}.csv` | 1 | localisation means with patient-clustered bootstrap CIs |
+| `all_stats_{delong,wilcoxon,mcnemar}_{ts}.csv` | 3 | one file per test family, Holm-adjusted |
+| `all_stats_chance_{ts}.csv` | 1 | pointing game under chance, analytic and Monte Carlo, with expected hits |
+| `all_sensitivity_noisy_or_{ts}.csv` | 1 | any-ICH AUC under max vs noisy-OR, per dataset and model |
+| `all_stats_report_{ts}.txt` | 1 | the whole analysis as a readable report, six sections |
+| `all_{roc_rsna,auc_rsna_dots,auc_forest,roc_external,pr_external,dist_dice,dist_iou,pvalues_dice_patient}_{ts}.png` | 8 | statistics figures |
 
-The statistics pass runs in `thesis.ipynb`, in the **Inferential statistics** section. It reads
-`all_raw_{ts}.npz` and calls each `stats_utils` test in its own cell, then writes the eight stats CSVs,
-the report and the eight statistics figures. It reuses the bundle timestamp, so re-running overwrites
-its own outputs instead of littering the directory. No GPU, about 3 minutes at `n_boot=2000`.
+Sample slices per dataset are set by `N_QUAL_IMGS = 2` and the RSNA panel by `N_QUAL_RSNA = 3`. Every figure is written at 300 dpi and sized to a fixed text width (`FIG_W = 6.7in`, `FIG_W_WIDE = 9.6in`), so it drops into the thesis without rescaling.
+
+The p-value heatmap is patient-level by default (`unit='patient'`), and `fig_pvalue_heatmap` raises if the filtered table still holds duplicate method pairs, since a duplicate would silently overwrite a cell.
+
+The statistics pass runs in `thesis.ipynb`, in the **Inferential statistics** section. It reads `all_raw_{ts}.npz` and calls each `stats_utils` test in its own cell, then writes the six CSVs (`auc`, `delong`, `seg_desc`, `wilcoxon`, `mcnemar`, `chance`), the report and the eight statistics figures. It reuses the bundle timestamp, so re-running overwrites its own outputs instead of littering the directory. No GPU, about 3 minutes at `n_boot=2000`.
 Step 7 writes the first copy of these files itself, via `stats_utils.run_all_analysis`.
 
 ---
@@ -218,7 +224,7 @@ Step 7 writes the first copy of these files itself, via `stats_utils.run_all_ana
 - PhysioNet pixel-supervised U-Net, Dice 0.4009 over all test slices (step 5)
 - Seg-CQ500 pixel-supervised U-Net, Dice 0.4372 over all test slices (step 6)
 - GradCAM maps generated (step 4)
-- `7_compare_all.py` run end to end (job 51534566), full statistics report in `result/`
+- `7_compare_all.py` run end to end (job 52036622, run `20260823_083800`), full statistics report in `result/`
 
 ---
 
@@ -262,37 +268,37 @@ Two ViT checkpoints score close to each other (0.9473 for the June model, 0.9407
 | subdural | 0.9323 | 0.9266 | 0.9417 | 0.8545 |
 | **weighted avg** | **0.9467** | **0.9407** | **0.9541** | **0.8957** |
 
-Step 7 recomputes these from the checkpoints and agrees to within rounding (CNN 0.9467, ViT 0.9406, Hybrid 0.9540, U-Net 0.8956), with DeLong CIs in `all_auc_results_{ts}.csv`.
+Step 7 recomputes these from the checkpoints and reproduces every value in the table exactly, with DeLong CIs in `all_auc_results_{ts}.csv`.
 
 Models saved to: `/rds/projects/k/karwatha-karwath-hds-pg-research/axr1222/models/`
 
-### external validation, zero-shot any-ICH (step 7, run `20260817_122608`)
+### external validation, zero-shot any-ICH (step 7, run `20260823_083800`)
 
 Slice-level "any ICH", max over the five subtype probabilities. CNN / ViT / Hybrid never saw these datasets; the U-Net rows were trained on the dataset they are scored on, so they are not a fair comparison, only a ceiling.
 
 | dataset | slices | positive | CNN | ViT | Hybrid | U-Net (in-domain) |
 |---------|-------:|---------:|----:|----:|-------:|------------------:|
-| PhysioNet | 542 | 40 | 0.8097 | 0.8046 | 0.8014 | 0.8617 |
-| Seg-CQ500 | 2,594 | 799 | 0.7233 | 0.7746 | 0.7905 | 0.8466 |
+| PhysioNet | 542 | 40 | 0.8098 | 0.8047 | 0.8015 | 0.8618 |
+| Seg-CQ500 | 2,594 | 799 | 0.7234 | 0.7746 | 0.7906 | 0.8467 |
 
-Against RSNA-internal 0.95, so the classifiers lose roughly 0.15 AUC off-domain. Noisy-OR instead of max gains 0.02 to 0.06 on every row and is logged as a sensitivity check.
+Against their own RSNA-internal weighted AUCs the classifiers lose 0.14 to 0.22 off-domain: CNN 0.137 on PhysioNet and 0.223 on Seg-CQ500, ViT 0.136 and 0.166, Hybrid 0.153 and 0.164. The CNN falls furthest, which is why the ranking inverts. Noisy-OR instead of max gains 0.02 to 0.06 on every row and is written to `all_sensitivity_noisy_or_{ts}.csv` as a sensitivity check.
 
 ### localisation quality (ICH-positive slices only, threshold 0.5)
 
 | dataset | method | Dice | IoU | recall | precision | pointing game | AP |
 |---------|--------|-----:|----:|-------:|----------:|--------------:|---:|
-| PhysioNet (n=40) | CNN | 0.0173 | 0.0092 | 0.0754 | 0.0102 | 0.0000 | 0.0143 |
+| PhysioNet (n=40 slices, 6 patients) | CNN | 0.0173 | 0.0092 | 0.0754 | 0.0102 | 0.0000 | 0.0143 |
 | | ViT | 0.0187 | 0.0096 | 0.4040 | 0.0096 | 0.0500 | 0.0211 |
 | | Hybrid | 0.0307 | 0.0164 | 0.1333 | 0.0182 | 0.0000 | 0.0202 |
 | | U-Net | 0.3315 | 0.2482 | 0.2862 | 0.5420 | 0.7000 | 0.4477 |
 | | Chance | 0.0080 | 0.0041 | 0.5053 | 0.0041 | 0.0000 | 0.0042 |
-| CQ500 (n=799) | CNN | 0.0174 | 0.0094 | 0.0496 | 0.0114 | 0.0125 | 0.0268 |
+| CQ500 (n=799 slices, 11 patients) | CNN | 0.0174 | 0.0094 | 0.0496 | 0.0114 | 0.0125 | 0.0268 |
 | | ViT | 0.0589 | 0.0324 | 0.4932 | 0.0340 | 0.1014 | 0.0664 |
 | | Hybrid | 0.0501 | 0.0286 | 0.1807 | 0.0339 | 0.0300 | 0.0506 |
 | | U-Net | 0.3641 | 0.2882 | 0.3475 | 0.4686 | 0.5807 | 0.4525 |
 | | Chance | 0.0176 | 0.0090 | 0.4982 | 0.0091 | 0.0175 | 0.0093 |
 
-Read every row against Chance, not against zero. A GradCAM is coarse by construction, so a low Dice against a supervised segmenter is expected and the pointing game is the fairer XAI metric. On that metric only ViT clears chance by a useful margin on CQ500 (0.1014 vs 0.0175). Chance recall is about 0.5 by construction and is indistinguishable from a random baseline
+Read every row against Chance. A GradCAM is coarse by construction, so a low Dice against a supervised segmenter is expected and the pointing game is the fairer XAI metric. On that metric only ViT clears chance by a useful margin on CQ500 (0.1014 vs 0.0175). Recall is the one column to ignore: a random map thresholded at 0.5 marks about half the image, so its recall is about 0.5 by construction and carries no information about any method.
 
 ---
 
@@ -317,7 +323,7 @@ Read every row against Chance, not against zero. A GradCAM is coarse by construc
 | `6_compare_physionet.py` | deprecated |
 | `7_compare_all.py` | cross-dataset comparison: GradCAM vs U-Net vs GT masks on PhysioNet and Seg-CQ500, classification AUC on all three datasets, full inferential statistics; writes to `~/thesis-xai/result/` |
 | `7_compare_all.sh` | sbatch for above (GPU, A100, 6h, 64G); installs nibabel if missing |
-| `stats_utils.py` | statistics and figure layer used by step 7 and the notebook: DeLong, Friedman, Wilcoxon, Cochran Q, McNemar, Mann-Whitney, Holm correction, patient-clustered bootstrap, report writer |
+| `stats_utils.py` | statistics and figure layer used by step 7 and the notebook: DeLong, Wilcoxon, McNemar, Holm correction, patient-clustered bootstrap, chance reference, report writer |
 | `result/` | every step 7 and notebook statistics output |
 | `training_logger.py` | saves model + appends row to `training_log.csv`; `model_status` column tracks ok/corrupted/deleted/retraining |
 | `training_log.csv` | all run results (timestamp, method, loss, AUCs, hyperparams, duration, model_status) |
@@ -373,7 +379,6 @@ Step 7 touches the full 75 GB RSNA test set as well, so it keeps `x_test` and `y
 - all experiments use SEED=20260605 -- same seed everywhere for reproducible splits
 - augmentation only during training -- `augment=False` for val/test in `_make_dataset`
 - hardcode model paths/filename in `3_train_hybrid.py`, `4_segmentation_xai.py`, `5_train_physionet_seg.py`, `6_train_cq500.py`, `7_compare_all.py`
-- never compare an external dataset to an in-domain model without saying so: on PhysioNet and CQ500 the U-Net trained on that dataset, the classifiers did not
 - every localisation number is read against the Chance row
 
 ---
@@ -381,13 +386,13 @@ Step 7 touches the full 75 GB RSNA test set as well, so it keeps `x_test` and `y
 ## things to watch
 
 - `InstanceNumber` all NaN in DICOM index
-- epidural AUC is lowest due to extreme rarity (0.27% prevalence)
+- epidural AUC is lowest due to extreme rarity: 351 of 101,823 test slices, 0.34% prevalence, and 1,643 of 475,870 in train, 0.35%
 - no learning curves saved yet -- add `history_` extraction to eval notebook
 - PhysioNet CSV column order differs from RSNA: Intraventricular, Intraparenchymal, Subarachnoid, Epidural, Subdural (capitalised)
 - the slice-level p-values in the statistics report are anti-conservative, slices within a patient are correlated; quote the `unit=patient` rows
 - CNN and U-Net checkpoints carry `nan_auc` in their filename because those runs set `SKIP_GRID_SEARCH = True`, so `grid.best_score_` is `float('nan')` and `save_models` writes `nan` into the name. Grid search over the full dataset was repeatedly OOM-killed (jobs 44066393, 44068843, 44072767, 44088354, plus a GPU allocator OOM in 44071888). The one search that completed, 44094050, returned a degenerate `Best CV score: 0.5000` from the `make_scorer` multilabel bug listed in the OOM notes. Hyperparameters were fixed from that run and no `best_cv_auc` has been recorded since. The test AUCs in `training_log.csv` come from complete retrains and are valid
-- with only 40 positive slices, the PhysioNet pointing game lacks the statistical power for meaningful evaluation. An expected chance baseline of 0.16 hits renders a 0.00 score indistinguishable from expected random variance.
+- with only 40 positive slices from 6 patients, the PhysioNet pointing game lacks the statistical power for meaningful evaluation. An expected chance baseline of 0.16 hits renders a 0.00 score indistinguishable from expected random variance
 
 ---
 
-*updated: 2026-08-22*
+*updated: 2026-08-23*
